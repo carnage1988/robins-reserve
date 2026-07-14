@@ -58,6 +58,74 @@ async def on_ready() -> None:
 
     print("=" * 60)
 
+async def process_preorder_dm(message: discord.Message) -> None:
+    """Check a DM for an active preorder trigger phrase."""
+
+    print(f"Received message: {message.content}")
+
+
+    if sheets is None:
+        await message.channel.send(
+            "❌ Preorders are temporarily unavailable."
+        )
+        return
+
+    try:
+        product = sheets.find_product_by_trigger(message.content)
+    except Exception:
+        logging.exception("Unable to check preorder trigger")
+        await message.channel.send(
+            "❌ I could not check the current preorders."
+        )
+        return
+
+    if product is None:
+        return
+
+    if product["stock"] <= 0:
+        await message.channel.send(
+            f"Sorry, **{product['product_name']}** is now fully allocated."
+        )
+        return
+
+    staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
+
+    if staff_channel is None:
+        logging.error("Configured staff channel could not be found")
+        await message.channel.send(
+            "❌ Your preorder could not be submitted."
+        )
+        return
+
+    approval_message = await staff_channel.send(
+        "📦 **New Preorder Request**\n"
+        f"Customer: {message.author.mention}\n"
+        f"Username: `{message.author}`\n"
+        f"Discord ID: `{message.author.id}`\n"
+        f"Product: **{product['product_name']}**\n"
+        f"Product ID: `{product['product_id']}`\n"
+        f"Stock remaining: `{product['stock']}`\n\n"
+        "React with 👍 to approve."
+    )
+
+    await approval_message.add_reaction("👍")
+
+    await message.channel.send(
+        f"✅ Your request for **{product['product_name']}** "
+        "has been sent for approval."
+    )
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """Process customer DMs while keeping normal commands working."""
+
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        await process_preorder_dm(message)
+
+    await bot.process_commands(message)
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context) -> None:

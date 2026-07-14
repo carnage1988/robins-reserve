@@ -80,7 +80,10 @@ class SheetsService:
             product = {
                 "product_id": product_id,
                 "product_name": product_name,
-                "category": str(record.get("Category", "")).strip(),
+                "trigger_phrase": str(
+        	    record.get("Trigger Phrase", "")
+    		).strip(),
+		"category": str(record.get("Category", "")).strip(),
                 "stock": stock,
                 "customer_limit": customer_limit,
                 "preorders_open": preorders_open,
@@ -92,6 +95,23 @@ class SheetsService:
             products.append(product)
 
         return products
+    
+    def find_product_by_trigger(
+     	self,
+    	message_content: str,
+    ) -> dict[str, Any] | None:
+    	"""Find an open product matching the customer's trigger phrase."""
+
+    	customer_message = message_content.strip().casefold()
+
+    	for product in self.get_products(open_only=True):
+            trigger_phrase = product["trigger_phrase"].strip().casefold()
+
+            if trigger_phrase and customer_message == trigger_phrase:
+            	return product
+
+    	return None 
+
 
     def connection_status(self) -> dict[str, Any]:
         """Return basic spreadsheet connection information."""
