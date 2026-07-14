@@ -1,9 +1,7 @@
 import logging
-from typing import Any
 
 import discord
 from discord.ext import commands
-
 from config import DISCORD_BOT_TOKEN, STAFF_CHANNEL_ID
 from sheets_service import SheetsService
 
@@ -12,8 +10,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
-logger = logging.getLogger(__name__)
 
 
 intents = discord.Intents.default()
@@ -25,21 +21,17 @@ bot = commands.Bot(
     help_command=None,
 )
 
-# Stores approval-message details while the bot is running.
-pending_requests: dict[int, dict[str, Any]] = {}
-
+pending_requests = {}
 
 try:
     sheets = SheetsService()
-except Exception:
-    logger.exception("Google Sheets connection failed")
+except Exception as exc:
+    logging.error("Google Sheets connection failed: %s", exc)
     sheets = None
 
 
 @bot.event
 async def on_ready() -> None:
-    """Display connection information when the bot starts."""
-
     print("=" * 60)
     print(f"Connected as: {bot.user}")
     print(f"Servers:      {len(bot.guilds)}")
@@ -58,21 +50,19 @@ async def on_ready() -> None:
             status = sheets.connection_status()
             print(f"Google Sheet: {status['title']}")
             print(f"Products:     {status['product_count']}")
-        except Exception:
-            logger.exception("Unable to read Google Sheets")
+        except Exception as exc:
+            logging.exception(
+                "Unable to read Google Sheets",
+                exc_info=exc,
+            )
 
     print("=" * 60)
 
-
 async def process_preorder_dm(message: discord.Message) -> None:
-    """Check a customer DM for an active preorder trigger phrase."""
+    """Check a DM for an active preorder trigger phrase."""
 
-    logger.info(
-        "Received DM from %s (%s): %r",
-        message.author,
-        message.author.id,
-        message.content,
-    )
+    print(f"Received message: {message.content}")
+
 
     if sheets is None:
         await message.channel.send(
@@ -83,13 +73,12 @@ async def process_preorder_dm(message: discord.Message) -> None:
     try:
         product = sheets.find_product_by_trigger(message.content)
     except Exception:
-        logger.exception("Unable to check preorder trigger")
+        logging.exception("Unable to check preorder trigger")
         await message.channel.send(
             "❌ I could not check the current preorders."
         )
         return
 
-    # Ignore DMs that do not match an active trigger phrase.
     if product is None:
         return
 
@@ -101,8 +90,8 @@ async def process_preorder_dm(message: discord.Message) -> None:
 
     staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
 
-    if not isinstance(staff_channel, discord.TextChannel):
-        logger.error("Configured staff channel could not be found")
+    if staff_channel is None:
+        logging.error("Configured staff channel could not be found")
         await message.channel.send(
             "❌ Your preorder could not be submitted."
         )
@@ -115,17 +104,16 @@ async def process_preorder_dm(message: discord.Message) -> None:
         f"Discord ID: `{message.author.id}`\n"
         f"Product: **{product['product_name']}**\n"
         f"Product ID: `{product['product_id']}`\n"
-        f"Stock remaining: `{product['stock']}`\n"
-        f"Customer limit: `{product['customer_limit']}`\n\n"
+        f"Stock remaining: `{product['stock']}`\n\n"
         "React with 👍 to approve."
     )
 
     await approval_message.add_reaction("👍")
 
     pending_requests[approval_message.id] = {
-        "discord_user_id": message.author.id,
-        "discord_username": str(message.author),
-        "product_id": product["product_id"],
+    	"discord_user_id": message.author.id,
+    	"discord_username": str(message.author),
+    	"product_id": product["product_id"],
     }
 
     await message.channel.send(
@@ -133,10 +121,9 @@ async def process_preorder_dm(message: discord.Message) -> None:
         "has been sent for approval."
     )
 
-
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    """Process DMs while preserving normal prefix commands."""
+    """Process customer DMs while keeping normal commands working."""
 
     if message.author.bot:
         return
@@ -146,33 +133,35 @@ async def on_message(message: discord.Message) -> None:
 
     await bot.process_commands(message)
 
-
 @bot.event
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
-    """Approve a preorder when staff adds a thumbs-up reaction."""
+    """Approve a preorder when staff reacts with a thumbs-up."""
 
+    # Ignore reactions added by the bot itself.
     if bot.user is None or payload.user_id == bot.user.id:
         return
 
+    # Only process reactions in the staff approval channel.
     if payload.channel_id != STAFF_CHANNEL_ID:
         return
 
+    # Only process the thumbs-up emoji.
     if str(payload.emoji) != "👍":
         return
 
     request = pending_requests.get(payload.message_id)
 
     if request is None:
-        logger.warning(
+        logging.warning(
             "No pending request found for approval message %s",
             payload.message_id,
         )
         return
 
     if sheets is None:
-        logger.error("Cannot approve preorder: Google Sheets unavailable")
+        logging.error("Google Sheets is not connected.")
         return
 
     guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
@@ -196,7 +185,7 @@ async def on_raw_reaction_add(
     except ValueError as exc:
         channel = bot.get_channel(payload.channel_id)
 
-        if isinstance(channel, discord.TextChannel):
+        if channel is not None:
             await channel.send(
                 f"❌ Could not approve preorder: {exc}"
             )
@@ -204,90 +193,77 @@ async def on_raw_reaction_add(
         return
 
     except Exception:
-        logger.exception("Unexpected preorder approval error")
+        logging.exception("Unexpected preorder approval error")
 
         channel = bot.get_channel(payload.channel_id)
 
-        if isinstance(channel, discord.TextChannel):
+        if channel is not None:
             await channel.send(
                 "❌ The preorder could not be approved."
             )
 
         return
 
-    # Inform the customer.
-    try:
-        customer = await bot.fetch_user(
-            int(request["discord_user_id"])
-        )
+   # Send confirmation to the customer.
+   try:
+       customer = await bot.fetch_user(
+           int(request["discord_user_id"])
+       )
 
-        await customer.send(
-            f"✅ Your preorder for **{product['product_name']}** "
-            "has been confirmed.\n\n"
-            f"🔐 Your pickup PIN is: **{product['pickup_pin']}**\n\n"
-            "Please show this PIN when collecting your order."
-        )
+       await customer.send(
+           f"✅ Your preorder for **{product['product_name']}** "
+           "has been confirmed.\n\n"
+           f"🔐 Your pickup PIN is: **{product['pickup_pin']}**\n\n"
+           "Please show this PIN when collecting your order."
+       )
 
-    except discord.HTTPException:
-        logger.warning(
-            "Could not send confirmation DM to user %s",
-            request["discord_user_id"],
-        )
+   except discord.HTTPException:
+       logging.warning(
+           "Could not send confirmation DM to user %s",
+           request["discord_user_id"],
+       )
 
-    # Inform staff and include the pickup PIN.
+    # Reply in the staff channel.
     channel = bot.get_channel(payload.channel_id)
 
-    if isinstance(channel, discord.TextChannel):
-        try:
-            approval_message = await channel.fetch_message(
-                payload.message_id
-            )
+    if channel is not None:
+        approval_message = await channel.fetch_message(
+            payload.message_id
+        )
 
-            await approval_message.reply(
-                "✅ **Approved**\n"
-                f"Pickup PIN: `{product['pickup_pin']}`\n"
-                f"Stock remaining: `{product['stock']}`\n"
-                f"Approved by: `{approved_by}`"
-            )
+        await approval_message.reply(
+            "✅ **Approved**\n"
+            f"Pickup PIN: `{product['pickup_pin']}`\n"
+            f"Stock remaining: `{product['stock']}`\n"
+            f"Approved by: `{approved_by}`"
+        )
 
-        except discord.HTTPException:
-            logger.exception(
-                "Could not update the approval message"
-            )
-
-    pending_requests.pop(payload.message_id, None)
-
+    del pending_requests[payload.message_id]
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context) -> None:
-    """Confirm that the bot is responsive."""
-
-    await ctx.send(
-        f"🏓 Pong! `{round(bot.latency * 1000)} ms`"
-    )
+    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)} ms`")
 
 
 @bot.command(name="status")
 async def status(ctx: commands.Context) -> None:
-    """Display Discord and Google Sheets connection status."""
-
     staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
 
     staff_status = (
         f"✅ #{staff_channel.name}"
-        if isinstance(staff_channel, discord.TextChannel)
+        if staff_channel
         else "❌ Not found"
     )
 
     sheets_status = (
         "✅ Connected"
-        if sheets is not None
+        if sheets
         else "❌ Not connected"
     )
 
     await ctx.send(
         "**Preorder Bot Status**\n"
-        "Discord: ✅ Online\n"
+        f"Discord: ✅ Online\n"
         f"Staff channel: {staff_status}\n"
         f"Google Sheets: {sheets_status}"
     )
@@ -298,26 +274,18 @@ async def products(ctx: commands.Context) -> None:
     """List products currently accepting preorders."""
 
     if sheets is None:
-        await ctx.send(
-            "❌ Google Sheets is not connected."
-        )
+        await ctx.send("❌ Google Sheets is not connected.")
         return
 
     try:
-        available_products = sheets.get_products(
-            open_only=True
-        )
+        available_products = sheets.get_products(open_only=True)
     except Exception:
-        logger.exception("Unable to retrieve products")
-        await ctx.send(
-            "❌ I could not read the product list."
-        )
+        logging.exception("Unable to retrieve products")
+        await ctx.send("❌ I could not read the product list.")
         return
 
     if not available_products:
-        await ctx.send(
-            "There are currently no open preorders."
-        )
+        await ctx.send("There are currently no open preorders.")
         return
 
     lines = ["**Current Preorders**"]
@@ -337,14 +305,10 @@ async def products(ctx: commands.Context) -> None:
 @bot.command(name="staff-test")
 @commands.has_permissions(administrator=True)
 async def staff_test(ctx: commands.Context) -> None:
-    """Send a test message to the configured staff channel."""
-
     staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
 
-    if not isinstance(staff_channel, discord.TextChannel):
-        await ctx.send(
-            "❌ Staff channel not found."
-        )
+    if staff_channel is None:
+        await ctx.send("❌ Staff channel not found.")
         return
 
     await staff_channel.send(
@@ -353,28 +317,6 @@ async def staff_test(ctx: commands.Context) -> None:
     )
 
     await ctx.send("✅ Test message sent.")
-
-
-@staff_test.error
-async def staff_test_error(
-    ctx: commands.Context,
-    error: commands.CommandError,
-) -> None:
-    """Handle permission errors for the staff test command."""
-
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send(
-            "❌ Only a server administrator can run this test."
-        )
-        return
-
-    logger.exception(
-        "The staff-test command failed",
-        exc_info=error,
-    )
-    await ctx.send(
-        "❌ The staff-channel test failed."
-    )
 
 
 bot.run(DISCORD_BOT_TOKEN)
