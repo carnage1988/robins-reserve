@@ -4,3 +4,6 @@ secrets/
 __pycache__/
 *.pyc
 *.log
+*_bkp.py
+*_backup.py
+

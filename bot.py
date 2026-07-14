@@ -1,5 +1,7 @@
 import logging
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -25,8 +27,14 @@ bot = commands.Bot(
     help_command=None,
 )
 
-# Stores approval-message details while the bot is running.
+# Approval-message details awaiting a staff reaction.
 pending_requests: dict[int, dict[str, Any]] = {}
+
+# Customer quantity prompts awaiting a numeric DM response.
+pending_quantity_requests: dict[int, dict[str, Any]] = {}
+
+# Customer baskets awaiting DONE.
+customer_baskets: dict[int, list[dict[str, Any]]] = {}
 
 
 try:
@@ -36,36 +44,201 @@ except Exception:
     sheets = None
 
 
-@bot.event
-async def on_ready() -> None:
-    """Display connection information when the bot starts."""
+def is_staff_channel(ctx: commands.Context) -> bool:
+    """Return True when a command is used in the staff approval channel."""
 
-    print("=" * 60)
-    print(f"Connected as: {bot.user}")
-    print(f"Servers:      {len(bot.guilds)}")
+    return ctx.guild is not None and ctx.channel.id == STAFF_CHANNEL_ID
+
+
+def format_datetime(timestamp: str) -> str:
+    """Convert an ISO timestamp into readable Belfast local time."""
+
+    if not timestamp:
+        return "Unknown"
+
+    parsed = datetime.fromisoformat(timestamp)
+
+    return parsed.astimezone(
+        ZoneInfo("Europe/London")
+    ).strftime("%d %b %Y at %H:%M")
+
+
+def format_items(items: list[dict[str, Any]]) -> str:
+    """Format order items for Discord messages."""
+
+    return "\n".join(
+        f"• **{item['quantity']} × {item['product_name']}**"
+        for item in items
+    )
+
+
+def basket_quantity_for_product(
+    basket: list[dict[str, Any]],
+    product_id: str,
+) -> int:
+    """Return the quantity of a product currently in a basket."""
+
+    return sum(
+        int(item["quantity"])
+        for item in basket
+        if item["product_id"] == product_id
+    )
+
+
+async def add_to_basket(
+    message: discord.Message,
+    product: dict[str, Any],
+    quantity: int,
+) -> None:
+    """Validate and add one product line to a customer's basket."""
+
+    if sheets is None:
+        await message.channel.send(
+            "❌ Preorders are temporarily unavailable."
+        )
+        return
+
+    basket = customer_baskets.setdefault(
+        message.author.id,
+        [],
+    )
+
+    existing_basket_quantity = basket_quantity_for_product(
+        basket,
+        product["product_id"],
+    )
+    approved_quantity = sheets.get_customer_product_total(
+        message.author.id,
+        product["product_id"],
+    )
+
+    remaining_limit = (
+        product["customer_limit"]
+        - approved_quantity
+        - existing_basket_quantity
+    )
+
+    if remaining_limit <= 0:
+        await message.channel.send(
+            f"❌ You have reached the limit for "
+            f"**{product['product_name']}**."
+        )
+        return
+
+    if quantity > remaining_limit:
+        await message.channel.send(
+            f"❌ You may only add **{remaining_limit}** more × "
+            f"**{product['product_name']}**."
+        )
+        return
+
+    if existing_basket_quantity + quantity > product["stock"]:
+        available_for_basket = max(
+            product["stock"] - existing_basket_quantity,
+            0,
+        )
+        await message.channel.send(
+            f"❌ Only **{available_for_basket}** more × "
+            f"**{product['product_name']}** are available."
+        )
+        return
+
+    for item in basket:
+        if item["product_id"] == product["product_id"]:
+            item["quantity"] += quantity
+            break
+    else:
+        basket.append(
+            {
+                "product_id": product["product_id"],
+                "product_name": product["product_name"],
+                "order_code": product["order_code"],
+                "quantity": quantity,
+            }
+        )
+
+    await message.channel.send(
+        f"🛒 Added **{quantity} × {product['product_name']}**.\n\n"
+        f"**Your basket**\n{format_items(basket)}\n\n"
+        "Send another order code to add more products, "
+        "type **DONE** to submit, or **CANCEL** to clear the basket."
+    )
+
+
+async def submit_basket(message: discord.Message) -> None:
+    """Send a customer's complete basket to the staff approval channel."""
+
+    basket = customer_baskets.get(message.author.id, [])
+
+    if not basket:
+        await message.channel.send(
+            "Your basket is empty. Send an order code to begin."
+        )
+        return
 
     staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
 
-    if staff_channel is None:
-        print("Staff channel: NOT FOUND")
-    else:
-        print(f"Staff channel: #{staff_channel.name}")
+    if not isinstance(staff_channel, discord.TextChannel):
+        logger.error("Configured staff channel could not be found")
+        await message.channel.send(
+            "❌ Your preorder could not be submitted."
+        )
+        return
 
-    if sheets is None:
-        print("Google Sheets: NOT CONNECTED")
-    else:
-        try:
-            status = sheets.connection_status()
-            print(f"Google Sheet: {status['title']}")
-            print(f"Products:     {status['product_count']}")
-        except Exception:
-            logger.exception("Unable to read Google Sheets")
+    request_embed = discord.Embed(
+        title="📦 New Preorder Basket",
+        description=(
+            "React with 👍 to approve the complete basket."
+        ),
+    )
+    request_embed.add_field(
+        name="Customer",
+        value=message.author.mention,
+        inline=False,
+    )
+    request_embed.add_field(
+        name="Username",
+        value=str(message.author),
+        inline=False,
+    )
+    request_embed.add_field(
+        name="Products",
+        value=format_items(basket),
+        inline=False,
+    )
+    request_embed.add_field(
+        name="Total Items",
+        value=str(
+            sum(int(item["quantity"]) for item in basket)
+        ),
+        inline=True,
+    )
+    request_embed.set_footer(
+        text=f"Discord ID: {message.author.id}"
+    )
 
-    print("=" * 60)
+    approval_message = await staff_channel.send(
+        embed=request_embed
+    )
+    await approval_message.add_reaction("👍")
+
+    pending_requests[approval_message.id] = {
+        "discord_user_id": message.author.id,
+        "discord_username": str(message.author),
+        "basket": [dict(item) for item in basket],
+    }
+
+    customer_baskets.pop(message.author.id, None)
+    pending_quantity_requests.pop(message.author.id, None)
+
+    await message.channel.send(
+        "✅ Your basket has been sent for staff approval.\n\n"
+        f"{format_items(basket)}"
+    )
 
 
 async def process_preorder_dm(message: discord.Message) -> None:
-    """Check a customer DM for an active preorder trigger phrase."""
+    """Process order codes, quantities and basket commands received by DM."""
 
     logger.info(
         "Received DM from %s (%s): %r",
@@ -80,57 +253,104 @@ async def process_preorder_dm(message: discord.Message) -> None:
         )
         return
 
+    content = message.content.strip()
+    command = content.casefold()
+
+    if command == "cancel":
+        pending_quantity_requests.pop(message.author.id, None)
+        customer_baskets.pop(message.author.id, None)
+        await message.channel.send(
+            "Your preorder basket was cleared."
+        )
+        return
+
+    if command == "done":
+        pending_quantity_requests.pop(message.author.id, None)
+        await submit_basket(message)
+        return
+
+    pending_product = pending_quantity_requests.get(
+        message.author.id
+    )
+
+    if pending_product is not None:
+        try:
+            quantity = int(content)
+        except ValueError:
+            await message.channel.send(
+                "Please reply with a whole number, or type **CANCEL**."
+            )
+            return
+
+        if quantity < 1:
+            await message.channel.send(
+                "Quantity must be at least 1."
+            )
+            return
+
+        product = pending_product["product"]
+
+        if quantity > product["customer_limit"]:
+            await message.channel.send(
+                f"The maximum quantity for "
+                f"**{product['product_name']}** is "
+                f"**{product['customer_limit']}**."
+            )
+            return
+
+        pending_quantity_requests.pop(message.author.id, None)
+        await add_to_basket(message, product, quantity)
+        return
+
     try:
-        product = sheets.find_product_by_trigger(message.content)
+        product = sheets.find_product_by_order_code(content)
     except Exception:
-        logger.exception("Unable to check preorder trigger")
+        logger.exception("Unable to check order code")
         await message.channel.send(
             "❌ I could not check the current preorders."
         )
         return
 
-    # Ignore DMs that do not match an active trigger phrase.
     if product is None:
+        try:
+            matches = sheets.find_products_by_partial_code(content)
+        except Exception:
+            logger.exception("Unable to search order codes")
+            return
+
+        if matches:
+            codes = "\n".join(
+                f"• `{match['order_code']}`"
+                for match in matches[:10]
+            )
+            await message.channel.send(
+                "I found these matching preorder codes:\n"
+                f"{codes}\n\n"
+                "Please send the full order code exactly as shown."
+            )
+
         return
 
     if product["stock"] <= 0:
         await message.channel.send(
-            f"Sorry, **{product['product_name']}** is now fully allocated."
+            f"Sorry, **{product['product_name']}** "
+            "is now fully allocated."
         )
         return
 
-    staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
-
-    if not isinstance(staff_channel, discord.TextChannel):
-        logger.error("Configured staff channel could not be found")
-        await message.channel.send(
-            "❌ Your preorder could not be submitted."
-        )
+    if product["customer_limit"] <= 1:
+        await add_to_basket(message, product, 1)
         return
 
-    approval_message = await staff_channel.send(
-        "📦 **New Preorder Request**\n"
-        f"Customer: {message.author.mention}\n"
-        f"Username: `{message.author}`\n"
-        f"Discord ID: `{message.author.id}`\n"
-        f"Product: **{product['product_name']}**\n"
-        f"Product ID: `{product['product_id']}`\n"
-        f"Stock remaining: `{product['stock']}`\n"
-        f"Customer limit: `{product['customer_limit']}`\n\n"
-        "React with 👍 to approve."
-    )
-
-    await approval_message.add_reaction("👍")
-
-    pending_requests[approval_message.id] = {
-        "discord_user_id": message.author.id,
-        "discord_username": str(message.author),
-        "product_id": product["product_id"],
+    pending_quantity_requests[message.author.id] = {
+        "product": product,
     }
 
     await message.channel.send(
-        f"✅ Your request for **{product['product_name']}** "
-        "has been sent for approval."
+        f"How many **{product['product_name']}** would you like?\n\n"
+        f"Maximum per customer: **{product['customer_limit']}**\n"
+        f"Available stock: **{product['stock']}**\n\n"
+        "Reply with a whole number, or type **CANCEL**."
     )
 
 
@@ -151,7 +371,7 @@ async def on_message(message: discord.Message) -> None:
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
-    """Approve a preorder when staff adds a thumbs-up reaction."""
+    """Approve a complete preorder basket with one pickup PIN."""
 
     if bot.user is None or payload.user_id == bot.user.id:
         return
@@ -172,23 +392,43 @@ async def on_raw_reaction_add(
         return
 
     if sheets is None:
-        logger.error("Cannot approve preorder: Google Sheets unavailable")
+        logger.error(
+            "Cannot approve preorder: Google Sheets unavailable"
+        )
         return
 
-    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-    approver = guild.get_member(payload.user_id) if guild else None
+    guild = (
+        bot.get_guild(payload.guild_id)
+        if payload.guild_id
+        else None
+    )
+    approver = (
+        guild.get_member(payload.user_id)
+        if guild
+        else None
+    )
+
+    if approver is None:
+        try:
+            approver = await bot.fetch_user(payload.user_id)
+        except discord.HTTPException:
+            approver = None
 
     approved_by = (
-        str(approver)
+        approver.display_name
         if approver is not None
         else str(payload.user_id)
     )
 
     try:
-        product = sheets.approve_preorder(
-            discord_username=str(request["discord_username"]),
-            discord_user_id=int(request["discord_user_id"]),
-            product_id=str(request["product_id"]),
+        approved_order = sheets.approve_basket(
+            discord_username=str(
+                request["discord_username"]
+            ),
+            discord_user_id=int(
+                request["discord_user_id"]
+            ),
+            basket=list(request["basket"]),
             approved_by=approved_by,
             approval_message_id=payload.message_id,
         )
@@ -200,41 +440,37 @@ async def on_raw_reaction_add(
             await channel.send(
                 f"❌ Could not approve preorder: {exc}"
             )
-
         return
 
     except Exception:
-        logger.exception("Unexpected preorder approval error")
-
+        logger.exception(
+            "Unexpected preorder basket approval error"
+        )
         channel = bot.get_channel(payload.channel_id)
 
         if isinstance(channel, discord.TextChannel):
             await channel.send(
-                "❌ The preorder could not be approved."
+                "❌ The preorder basket could not be approved."
             )
-
         return
 
-    # Inform the customer.
     try:
         customer = await bot.fetch_user(
             int(request["discord_user_id"])
         )
-
         await customer.send(
-            f"✅ Your preorder for **{product['product_name']}** "
-            "has been confirmed.\n\n"
-            f"🔐 Your pickup PIN is: **{product['pickup_pin']}**\n\n"
-            "Please show this PIN when collecting your order."
+            "✅ **Robin's Reserve Preorder Approved**\n\n"
+            f"{format_items(approved_order['items'])}\n\n"
+            f"🔐 Pickup PIN: "
+            f"**{approved_order['pickup_pin']}**\n\n"
+            "Please show this PIN when collecting the order."
         )
-
     except discord.HTTPException:
         logger.warning(
             "Could not send confirmation DM to user %s",
             request["discord_user_id"],
         )
 
-    # Inform staff and include the pickup PIN.
     channel = bot.get_channel(payload.channel_id)
 
     if isinstance(channel, discord.TextChannel):
@@ -242,12 +478,35 @@ async def on_raw_reaction_add(
             approval_message = await channel.fetch_message(
                 payload.message_id
             )
+            approved_embed = discord.Embed(
+                title="✅ Preorder Basket Approved",
+                description=(
+                    f"Pickup PIN: "
+                    f"`{approved_order['pickup_pin']}`"
+                ),
+            )
+            approved_embed.add_field(
+                name="Products",
+                value=format_items(
+                    approved_order["items"]
+                ),
+                inline=False,
+            )
+            approved_embed.add_field(
+                name="Total Items",
+                value=str(
+                    approved_order["total_quantity"]
+                ),
+                inline=True,
+            )
+            approved_embed.add_field(
+                name="Approved By",
+                value=approved_by,
+                inline=False,
+            )
 
             await approval_message.reply(
-                "✅ **Approved**\n"
-                f"Pickup PIN: `{product['pickup_pin']}`\n"
-                f"Stock remaining: `{product['stock']}`\n"
-                f"Approved by: `{approved_by}`"
+                embed=approved_embed
             )
 
         except discord.HTTPException:
@@ -256,6 +515,194 @@ async def on_raw_reaction_add(
             )
 
     pending_requests.pop(payload.message_id, None)
+
+
+@bot.command(name="lookup")
+async def lookup(
+    ctx: commands.Context,
+    pickup_pin: str = "",
+) -> None:
+    """Look up an active or collected preorder basket by PIN."""
+
+    if not is_staff_channel(ctx):
+        await ctx.send(
+            "❌ This command can only be used in the "
+            "staff approval channel."
+        )
+        return
+
+    if not pickup_pin:
+        await ctx.send("Usage: `!lookup <pickup PIN>`")
+        return
+
+    if sheets is None:
+        await ctx.send(
+            "❌ Google Sheets is not connected."
+        )
+        return
+
+    try:
+        order = sheets.lookup_by_pin(pickup_pin)
+    except Exception:
+        logger.exception("Unable to look up preorder")
+        await ctx.send(
+            "❌ The preorder lookup failed."
+        )
+        return
+
+    if order is None:
+        await ctx.send(
+            f"❌ No preorder was found for PIN "
+            f"`{pickup_pin}`."
+        )
+        return
+
+    embed = discord.Embed(
+        title="🔎 Robin's Reserve Lookup",
+        description=(
+            f"Pickup PIN: `{order['pickup_pin']}`"
+        ),
+    )
+    embed.add_field(
+        name="Customer",
+        value=(
+            order["discord_username"]
+            or "Unknown"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Products",
+        value=format_items(order["items"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Total Items",
+        value=str(order["total_quantity"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Status",
+        value=order["status"],
+        inline=True,
+    )
+    embed.add_field(
+        name="Approved By",
+        value=order["approved_by"] or "Unknown",
+        inline=False,
+    )
+
+    if str(order["status"]).casefold() == "collected":
+        embed.add_field(
+            name="Collected By",
+            value=order["collected_by"] or "Unknown",
+            inline=False,
+        )
+        embed.add_field(
+            name="Collected At",
+            value=format_datetime(
+                order["collected_at"]
+            ),
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="collect")
+async def collect(
+    ctx: commands.Context,
+    pickup_pin: str = "",
+) -> None:
+    """Collect and archive an entire preorder basket."""
+
+    if not is_staff_channel(ctx):
+        await ctx.send(
+            "❌ This command can only be used in the "
+            "staff approval channel."
+        )
+        return
+
+    if not pickup_pin:
+        await ctx.send("Usage: `!collect <pickup PIN>`")
+        return
+
+    if sheets is None:
+        await ctx.send(
+            "❌ Google Sheets is not connected."
+        )
+        return
+
+    try:
+        order = sheets.collect_order(
+            pickup_pin=pickup_pin,
+            collected_by=str(ctx.author),
+        )
+
+    except ValueError as exc:
+        await ctx.send(f"❌ {exc}")
+        return
+
+    except Exception:
+        logger.exception("Unable to collect preorder")
+        await ctx.send(
+            "❌ The preorder could not be marked "
+            "as collected."
+        )
+        return
+
+    try:
+        customer = await bot.fetch_user(
+            int(order["discord_user_id"])
+        )
+        await customer.send(
+            "✅ **Robin's Reserve Collection Complete**\n\n"
+            f"{format_items(order['items'])}\n\n"
+            f"Collected: "
+            f"**{format_datetime(order['collected_at'])}**\n\n"
+            "Thank you for ordering with Robin's Reserve!"
+        )
+    except (ValueError, discord.HTTPException):
+        logger.warning(
+            "Could not send collection confirmation to user %s",
+            order["discord_user_id"],
+        )
+
+    embed = discord.Embed(
+        title="✅ Collection Complete",
+        description=(
+            f"Pickup PIN: `{order['pickup_pin']}`"
+        ),
+    )
+    embed.add_field(
+        name="Products",
+        value=format_items(order["items"]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Total Items",
+        value=str(order["total_quantity"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Status",
+        value=order["status"],
+        inline=True,
+    )
+    embed.add_field(
+        name="Collected By",
+        value=order["collected_by"],
+        inline=False,
+    )
+    embed.add_field(
+        name="Collected At",
+        value=format_datetime(
+            order["collected_at"]
+        ),
+        inline=False,
+    )
+
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="ping")
@@ -275,7 +722,10 @@ async def status(ctx: commands.Context) -> None:
 
     staff_status = (
         f"✅ #{staff_channel.name}"
-        if isinstance(staff_channel, discord.TextChannel)
+        if isinstance(
+            staff_channel,
+            discord.TextChannel,
+        )
         else "❌ Not found"
     )
 
@@ -286,7 +736,7 @@ async def status(ctx: commands.Context) -> None:
     )
 
     await ctx.send(
-        "**Preorder Bot Status**\n"
+        "**Robin's Reserve Status**\n"
         "Discord: ✅ Online\n"
         f"Staff channel: {staff_status}\n"
         f"Google Sheets: {sheets_status}"
@@ -320,15 +770,19 @@ async def products(ctx: commands.Context) -> None:
         )
         return
 
-    lines = ["**Current Preorders**"]
+    lines = [
+        "**Robin's Reserve — Current Preorders**"
+    ]
 
     for product in available_products:
         lines.append(
             "\n"
             f"**{product['product_name']}**\n"
-            f"Product ID: `{product['product_id']}`\n"
+            f"Order code: "
+            f"`{product['order_code']}`\n"
             f"Stock: {product['stock']}\n"
-            f"Customer limit: {product['customer_limit']}"
+            f"Customer limit: "
+            f"{product['customer_limit']}"
         )
 
     await ctx.send("\n".join(lines))
@@ -336,12 +790,17 @@ async def products(ctx: commands.Context) -> None:
 
 @bot.command(name="staff-test")
 @commands.has_permissions(administrator=True)
-async def staff_test(ctx: commands.Context) -> None:
+async def staff_test(
+    ctx: commands.Context,
+) -> None:
     """Send a test message to the configured staff channel."""
 
     staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
 
-    if not isinstance(staff_channel, discord.TextChannel):
+    if not isinstance(
+        staff_channel,
+        discord.TextChannel,
+    ):
         await ctx.send(
             "❌ Staff channel not found."
         )
@@ -362,9 +821,13 @@ async def staff_test_error(
 ) -> None:
     """Handle permission errors for the staff test command."""
 
-    if isinstance(error, commands.MissingPermissions):
+    if isinstance(
+        error,
+        commands.MissingPermissions,
+    ):
         await ctx.send(
-            "❌ Only a server administrator can run this test."
+            "❌ Only a server administrator "
+            "can run this test."
         )
         return
 
