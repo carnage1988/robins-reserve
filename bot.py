@@ -1,18 +1,50 @@
+import json
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
 
-from config import DISCORD_BOT_TOKEN, STAFF_CHANNEL_ID
+from config import (
+    DISCORD_BOT_TOKEN,
+    STAFF_CHANNEL_ID,
+    STAFF_ROLE_ID,
+)
 from sheets_service import SheetsService
 
 
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+DATA_DIR = BASE_DIR / "data"
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOG_DIR / "robins_reserve.log"
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    mode="a",
+    maxBytes=5 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        console_handler,
+        file_handler,
+    ],
 )
 
 logger = logging.getLogger(__name__)
@@ -25,10 +57,70 @@ bot = commands.Bot(
     command_prefix="!",
     intents=intents,
     help_command=None,
+    status=discord.Status.online,
+    activity=discord.Game(name="Managing preorders"),
 )
 
 # Approval-message details awaiting a staff reaction.
+# These are persisted so pending approvals survive bot restarts.
+PENDING_REQUESTS_FILE = DATA_DIR / "pending_requests.json"
 pending_requests: dict[int, dict[str, Any]] = {}
+
+
+def load_pending_requests() -> dict[int, dict[str, Any]]:
+    """Load pending approval requests from disk."""
+
+    if not PENDING_REQUESTS_FILE.exists():
+        return {}
+
+    try:
+        raw_data = json.loads(
+            PENDING_REQUESTS_FILE.read_text(encoding="utf-8")
+        )
+
+        if not isinstance(raw_data, dict):
+            raise ValueError("Pending request data must be a JSON object")
+
+        loaded_requests = {
+            int(message_id): request
+            for message_id, request in raw_data.items()
+            if isinstance(request, dict)
+        }
+
+        logger.info(
+            "Loaded %s pending approval request(s)",
+            len(loaded_requests),
+        )
+        return loaded_requests
+
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logger.exception(
+            "Could not load pending approvals from %s",
+            PENDING_REQUESTS_FILE,
+        )
+        return {}
+
+
+def save_pending_requests() -> None:
+    """Write pending approval requests to disk atomically."""
+
+    temporary_file = PENDING_REQUESTS_FILE.with_suffix(".json.tmp")
+
+    try:
+        temporary_file.write_text(
+            json.dumps(pending_requests, indent=2),
+            encoding="utf-8",
+        )
+        temporary_file.replace(PENDING_REQUESTS_FILE)
+
+    except OSError:
+        logger.exception(
+            "Could not save pending approvals to %s",
+            PENDING_REQUESTS_FILE,
+        )
+
+
+pending_requests.update(load_pending_requests())
 
 # Customer quantity prompts awaiting a numeric DM response.
 pending_quantity_requests: dict[int, dict[str, Any]] = {}
@@ -227,6 +319,7 @@ async def submit_basket(message: discord.Message) -> None:
         "discord_username": str(message.author),
         "basket": [dict(item) for item in basket],
     }
+    save_pending_requests()
 
     customer_baskets.pop(message.author.id, None)
     pending_quantity_requests.pop(message.author.id, None)
@@ -311,6 +404,15 @@ async def process_preorder_dm(message: discord.Message) -> None:
         )
         return
 
+    if product is not None and not product["preorders_open"]:
+        await message.channel.send(
+            f"🚫 Preorders for **{product['product_name']}** "
+            "are currently closed.\n\n"
+            "Please keep an eye on the server announcements "
+            "for updates."
+        )
+        return
+
     if product is None:
         try:
             matches = sheets.find_products_by_partial_code(content)
@@ -324,9 +426,15 @@ async def process_preorder_dm(message: discord.Message) -> None:
                 for match in matches[:10]
             )
             await message.channel.send(
-                "I found these matching preorder codes:\n"
+                "❓ I found these matching preorder codes:\n\n"
                 f"{codes}\n\n"
                 "Please send the full order code exactly as shown."
+            )
+        else:
+            await message.channel.send(
+                "❌ **That isn't a recognised order code.**\n\n"
+                "Please use **`!products`** to see the products currently available for preorder.\n\n"
+                "If you think this is an error, please contact a member of staff."
             )
 
         return
@@ -402,23 +510,60 @@ async def on_raw_reaction_add(
         if payload.guild_id
         else None
     )
-    approver = (
-        guild.get_member(payload.user_id)
-        if guild
-        else None
-    )
+
+    if guild is None:
+        logger.warning(
+            "Could not identify the server for approval attempt"
+        )
+        return
+
+    approver = guild.get_member(payload.user_id)
 
     if approver is None:
         try:
-            approver = await bot.fetch_user(payload.user_id)
+            approver = await guild.fetch_member(payload.user_id)
         except discord.HTTPException:
-            approver = None
+            logger.warning(
+                "Could not retrieve member %s for approval check",
+                payload.user_id,
+            )
+            return
 
-    approved_by = (
-        approver.display_name
-        if approver is not None
-        else str(payload.user_id)
+    has_staff_role = any(
+        role.id == STAFF_ROLE_ID
+        for role in approver.roles
     )
+
+    if not has_staff_role:
+        logger.warning(
+            "Unauthorised approval attempt by %s (%s)",
+            approver,
+            approver.id,
+        )
+
+        channel = bot.get_channel(payload.channel_id)
+
+        if isinstance(channel, discord.TextChannel):
+            try:
+                approval_message = await channel.fetch_message(
+                    payload.message_id
+                )
+                await approval_message.remove_reaction(
+                    payload.emoji,
+                    approver,
+                )
+                await channel.send(
+                    f"⚠️ {approver.mention} is not authorised "
+                    "to approve preorders."
+                )
+            except discord.HTTPException:
+                logger.warning(
+                    "Could not remove unauthorised reaction"
+                )
+
+        return
+
+    approved_by = approver.display_name
 
     try:
         approved_order = sheets.approve_basket(
@@ -515,6 +660,7 @@ async def on_raw_reaction_add(
             )
 
     pending_requests.pop(payload.message_id, None)
+    save_pending_requests()
 
 
 @bot.command(name="lookup")
@@ -839,5 +985,14 @@ async def staff_test_error(
         "❌ The staff-channel test failed."
     )
 
+
+@bot.event
+async def on_ready():
+    logger.info("Logged in as %s", bot.user)
+    logger.info("User ID: %s", bot.user.id)
+    logger.info(
+        "Pending approvals available after startup: %s",
+        len(pending_requests),
+    )
 
 bot.run(DISCORD_BOT_TOKEN)

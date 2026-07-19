@@ -1,0 +1,32 @@
+services:
+  robins-reserve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: robins-reserve:1.0.0
+    container_name: robins-reserve
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('/app/logs/robins_reserve.log').exists() else 1)\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    security_opt:
+      - no-new-privileges:true

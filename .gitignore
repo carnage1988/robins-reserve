@@ -1,9 +1,42 @@
-.venv
-.env
-secrets/
+# Python
+.venv/
+venv/
 __pycache__/
-*.pyc
-*.log
-*_bkp.py
-*_backup.py
+*.py[cod]
+*.pyo
 
+# Environment and credentials
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+
+# Runtime state
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+pending_requests.json
+pending_requests.json.tmp
+robins_reserve.log*
+local_test_run.log
+
+# Test/cache tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
+*.tar
+*.tar.gz

@@ -147,11 +147,11 @@ class SheetsService:
         self,
         message_content: str,
     ) -> dict[str, Any] | None:
-        """Find an open product matching an exact order code."""
+        """Find a product matching an exact order code."""
 
         customer_message = message_content.strip().casefold()
 
-        for product in self.get_products(open_only=True):
+        for product in self.get_products(open_only=False):
             order_code = product["order_code"].strip().casefold()
 
             if order_code and customer_message == order_code:
