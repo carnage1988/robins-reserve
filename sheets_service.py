@@ -357,6 +357,86 @@ class SheetsService:
             if self.lookup_by_pin(pickup_pin) is None:
                 return pickup_pin
 
+    def _prepare_stock_updates(
+        self,
+        normalized_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Determine the stock changes required for a basket."""
+
+        headers = self.products_sheet.row_values(1)
+
+        try:
+            product_id_column = headers.index("Product ID") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Products sheet is missing Product ID header."
+            ) from exc
+
+        stock_updates: list[dict[str, Any]] = []
+
+        for item in normalized_items:
+            product_cell = self.products_sheet.find(
+                item["product_id"],
+                in_column=product_id_column,
+            )
+
+            if product_cell is None:
+                raise ValueError(
+                    f"Could not locate {item['product_name']} in Products."
+                )
+
+            stock_updates.append(
+                {
+                    "row": product_cell.row,
+                    "old_stock": item["stock"],
+                    "new_stock": item["stock"] - item["quantity"],
+                }
+            )
+
+        return stock_updates
+
+    def _get_stock_column(self) -> int:
+        """Return the one-based Stock column number."""
+
+        headers = self.products_sheet.row_values(1)
+
+        try:
+            return headers.index("Stock") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Products sheet is missing Stock header."
+            ) from exc
+
+    def _apply_stock_updates(
+        self,
+        stock_updates: list[dict[str, Any]],
+    ) -> None:
+        """Apply stock changes to the Products sheet."""
+
+        stock_column = self._get_stock_column()
+
+        for update in stock_updates:
+            self.products_sheet.update_cell(
+                update["row"],
+                stock_column,
+                update["new_stock"],
+            )
+
+    def _rollback_stock_updates(
+        self,
+        stock_updates: list[dict[str, Any]],
+    ) -> None:
+        """Restore stock values after a failed operation."""
+
+        stock_column = self._get_stock_column()
+
+        for update in stock_updates:
+            self.products_sheet.update_cell(
+                update["row"],
+                stock_column,
+                update["old_stock"],
+            )
+
     def approve_basket(
         self,
         *,
@@ -431,48 +511,16 @@ class SheetsService:
                 }
             )
 
-        headers = self.products_sheet.row_values(1)
-
-        try:
-            product_id_column = headers.index("Product ID") + 1
-            stock_column = headers.index("Stock") + 1
-        except ValueError as exc:
-            raise RuntimeError(
-                "Products sheet is missing Product ID or Stock headers."
-            ) from exc
-
-        stock_updates: list[dict[str, Any]] = []
-
-        for item in normalized_items:
-            product_cell = self.products_sheet.find(
-                item["product_id"],
-                in_column=product_id_column,
-            )
-
-            if product_cell is None:
-                raise ValueError(
-                    f"Could not locate {item['product_name']} in Products."
-                )
-
-            stock_updates.append(
-                {
-                    "row": product_cell.row,
-                    "old_stock": item["stock"],
-                    "new_stock": item["stock"] - item["quantity"],
-                }
-            )
+        stock_updates = self._prepare_stock_updates(
+            normalized_items
+        )
 
         pickup_pin = self._generate_unique_pin()
         timestamp = datetime.now(timezone.utc).isoformat()
         appended_rows = 0
 
         try:
-            for update in stock_updates:
-                self.products_sheet.update_cell(
-                    update["row"],
-                    stock_column,
-                    update["new_stock"],
-                )
+            self._apply_stock_updates(stock_updates)
 
             for item in normalized_items:
                 self.preorders_sheet.append_row(
@@ -495,12 +543,7 @@ class SheetsService:
                 appended_rows += 1
 
         except Exception:
-            for update in stock_updates:
-                self.products_sheet.update_cell(
-                    update["row"],
-                    stock_column,
-                    update["old_stock"],
-                )
+            self._rollback_stock_updates(stock_updates)
 
             for _ in range(appended_rows):
                 self.preorders_sheet.delete_rows(

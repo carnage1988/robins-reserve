@@ -468,8 +468,10 @@ async def on_message(message: discord.Message) -> None:
 
     if message.author.bot:
         return
+    
+    is_command = message.content.lstrip().startswith("!")
 
-    if message.guild is None:
+    if message.guild is None and not is_command:
         await process_preorder_dm(message)
 
     await bot.process_commands(message)
