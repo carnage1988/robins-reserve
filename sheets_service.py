@@ -314,7 +314,7 @@ class SheetsService:
         discord_user_id: int,
         product_id: str,
     ) -> int:
-        """Return the customer's approved and collected quantity."""
+        """Return the customer's pending, approved and collected quantity."""
 
         total = 0
         target_user_id = str(discord_user_id)
@@ -337,7 +337,7 @@ class SheetsService:
                 if (
                     recorded_user_id == target_user_id
                     and recorded_product_id == product_id
-                    and status in {"approved", "collected"}
+                    and status in {"pending", "approved", "collected"}
                 ):
                     try:
                         total += int(record.get("Quantity", 0))
@@ -436,6 +436,140 @@ class SheetsService:
                 stock_column,
                 update["old_stock"],
             )
+
+    def reserve_basket(
+        self,
+        *,
+        discord_username: str,
+        discord_user_id: int,
+        basket: list[dict[str, Any]],
+        approval_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Reserve stock and create a pending preorder under one pickup PIN."""
+
+        if not basket:
+            raise ValueError("The basket is empty.")
+
+        products = {
+            product["product_id"]: product
+            for product in self.get_products()
+        }
+
+        normalized_items: list[dict[str, Any]] = []
+
+        for basket_item in basket:
+            product_id = str(basket_item["product_id"])
+            quantity = int(basket_item["quantity"])
+
+            if quantity < 1:
+                raise ValueError("Quantity must be at least 1.")
+
+            product = products.get(product_id)
+
+            if product is None:
+                raise ValueError(
+                    f"Product {product_id} no longer exists."
+                )
+
+            if not product["preorders_open"]:
+                raise ValueError(
+                    f"Preorders are closed for "
+                    f"{product['product_name']}."
+                )
+
+            if quantity > product["stock"]:
+                raise ValueError(
+                    f"Only {product['stock']} × "
+                    f"{product['product_name']} remain."
+                )
+
+            current_total = self.get_customer_product_total(
+                discord_user_id,
+                product_id,
+            )
+
+            if current_total + quantity > product["customer_limit"]:
+                remaining_limit = max(
+                    product["customer_limit"] - current_total,
+                    0,
+                )
+                raise ValueError(
+                    f"The customer may only order {remaining_limit} more × "
+                    f"{product['product_name']}."
+                )
+
+            normalized_items.append(
+                {
+                    **product,
+                    "quantity": quantity,
+                }
+            )
+
+        stock_updates = self._prepare_stock_updates(
+            normalized_items
+        )
+
+        pickup_pin = self._generate_unique_pin()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        recorded_message_id = (
+            str(approval_message_id)
+            if approval_message_id is not None
+            else ""
+        )
+        appended_rows = 0
+
+        try:
+            self._apply_stock_updates(stock_updates)
+
+            for item in normalized_items:
+                self.preorders_sheet.append_row(
+                    [
+                        timestamp,
+                        discord_username,
+                        str(discord_user_id),
+                        item["product_id"],
+                        item["product_name"],
+                        item["quantity"],
+                        "Pending",
+                        "",
+                        recorded_message_id,
+                        pickup_pin,
+                        "",
+                        "",
+                    ],
+                    value_input_option="USER_ENTERED",
+                )
+                appended_rows += 1
+
+        except Exception:
+            self._rollback_stock_updates(stock_updates)
+
+            for _ in range(appended_rows):
+                self.preorders_sheet.delete_rows(
+                    len(self.preorders_sheet.get_all_values())
+                )
+
+            raise
+
+        reserved_items = []
+
+        for item, update in zip(normalized_items, stock_updates):
+            reserved_items.append(
+                {
+                    **item,
+                    "stock": update["new_stock"],
+                    "status": "Pending",
+                }
+            )
+
+        return {
+            "pickup_pin": pickup_pin,
+            "status": "Pending",
+            "items": reserved_items,
+            "total_quantity": sum(
+                item["quantity"] for item in reserved_items
+            ),
+        }
 
     def approve_basket(
         self,
