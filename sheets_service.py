@@ -571,6 +571,102 @@ class SheetsService:
             ),
         }
 
+    def approve_reservation(
+        self,
+        *,
+        pickup_pin: str,
+        approved_by: str,
+        approval_message_id: int,
+    ) -> dict[str, Any]:
+        """Approve an existing pending reservation without changing stock."""
+
+        order = self.lookup_by_pin(pickup_pin)
+
+        if order is None:
+            raise ValueError(
+                "No pending preorder was found for that pickup PIN."
+            )
+
+        if order["sheet_name"] != "Preorders":
+            raise ValueError(
+                "This preorder is no longer awaiting approval."
+            )
+
+        status = str(order["status"]).strip().casefold()
+
+        if status == "approved":
+            raise ValueError(
+                "This preorder has already been approved."
+            )
+
+        if status != "pending":
+            raise ValueError(
+                f"This preorder cannot be approved because its status is "
+                f"'{order['status']}'."
+            )
+
+        headers = self.preorders_sheet.row_values(1)
+
+        try:
+            status_column = headers.index("Status") + 1
+            approved_by_column = headers.index("Approved By") + 1
+            message_id_column = (
+                headers.index("Approval Message ID") + 1
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "Preorders sheet is missing approval workflow headers."
+            ) from exc
+
+        updated_rows: list[int] = []
+
+        try:
+            for item in order["items"]:
+                row_number = int(item["row_number"])
+
+                self.preorders_sheet.update_cell(
+                    row_number,
+                    status_column,
+                    "Approved",
+                )
+                self.preorders_sheet.update_cell(
+                    row_number,
+                    approved_by_column,
+                    approved_by,
+                )
+                self.preorders_sheet.update_cell(
+                    row_number,
+                    message_id_column,
+                    str(approval_message_id),
+                )
+                updated_rows.append(row_number)
+
+        except Exception:
+            for row_number in updated_rows:
+                self.preorders_sheet.update_cell(
+                    row_number,
+                    status_column,
+                    "Pending",
+                )
+                self.preorders_sheet.update_cell(
+                    row_number,
+                    approved_by_column,
+                    "",
+                )
+            raise
+
+        order["status"] = "Approved"
+        order["approved_by"] = approved_by
+
+        for item in order["items"]:
+            item["status"] = "Approved"
+            item["approved_by"] = approved_by
+            item["approval_message_id"] = str(
+                approval_message_id
+            )
+
+        return order
+
     def approve_basket(
         self,
         *,
