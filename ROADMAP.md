@@ -1,25 +1,31 @@
 # Robin's Reserve Roadmap
 
-This document outlines the planned development of Robin's Reserve beyond the initial production release.
+This document outlines the planned development of Robin's Reserve beyond the current production release.
 
 ---
 
 # Current Release
 
-## v1.0.0 ✅
+## v1.1.0 ✅
 
-Initial production release featuring:
+Current production release featuring:
 
 - Discord DM preorder workflow
-- Staff approval via reactions
-- Google Sheets integration
-- Automatic stock deduction
 - Basket ordering
+- Staff approval via reactions
+- Staff rejection workflow
+- Customer cancellation
+- Staff cancellation
+- Google Sheets integration
+- Automatic stock management
 - Pickup PIN generation
 - Order lookup (`!lookup`)
 - Order collection (`!collect`)
+- Cancelled order archive
+- Rejected order archive
 - Collection archive
 - Persistent pending requests
+- OrderManager lifecycle engine
 - Docker deployment
 - Structured logging
 
@@ -27,24 +33,23 @@ Initial production release featuring:
 
 # Upcoming Releases
 
-## v1.1.0 - Order Management
+## v1.2.0 - Reporting & Search
 
-### New Features
+### Planned Features
 
-- Reject preorder requests
-- Customer notification when an order is declined
-- Cancel approved reservations
-- Automatic stock restoration
-- Cancelled order archive
-- Improved audit logging
+- Improved order search
+- Enhanced reporting
+- Staff statistics
+- Search by Discord user
+- Search by product
 
 ---
 
 # Long-Term Goals
 
-## Dashboard
+## Web Dashboard
 
-A web-based administration dashboard allowing staff to:
+A browser-based administration dashboard allowing staff to:
 
 - View active reservations
 - Search orders
@@ -52,6 +57,16 @@ A web-based administration dashboard allowing staff to:
 - View collection history
 - Configure products
 - Review statistics
+
+---
+
+## Reservation Management
+
+Future improvements may include:
+
+- Automatic reservation expiry
+- Customer reminder notifications
+- Configurable reservation duration
 
 ---
 
@@ -70,12 +85,9 @@ Allowing stores to optionally request payment before collection.
 
 These features are being evaluated and are not currently planned for a specific release.
 
-- QR codes for collection
+- QR code collection
 - Barcode scanning
 - Email notifications
 - Customer loyalty tracking
-- Automatic reservation expiry
 - Public product catalogue
 - Webhook integrations
-
----
