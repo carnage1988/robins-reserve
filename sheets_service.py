@@ -12,10 +12,168 @@ from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID
 logger = logging.getLogger(__name__)
 
 
+class OrderManager:
+    """Coordinate safe order lifecycle transitions between worksheets."""
+
+    def __init__(self, service: "SheetsService") -> None:
+        self.service = service
+
+    def approve(
+        self,
+        *,
+        pickup_pin: str,
+        approved_by: str,
+        approval_message_id: int,
+    ) -> dict[str, Any]:
+        order = self.service.lookup_by_pin(pickup_pin)
+        if order is None:
+            raise ValueError("No pending preorder was found for that pickup PIN.")
+        if order["sheet_name"] != "Preorders":
+            raise ValueError("This preorder is no longer awaiting approval.")
+        status = str(order["status"]).strip().casefold()
+        if status != "pending":
+            raise ValueError(
+                f"This preorder cannot be approved because its status is "
+                f"'{order['status']}'."
+            )
+
+        sheet = self.service.preorders_sheet
+        headers = sheet.row_values(1)
+        try:
+            status_col = headers.index("Status") + 1
+            approved_col = headers.index("Approved By") + 1
+            message_col = headers.index("Approval Message ID") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Preorders sheet is missing approval workflow headers."
+            ) from exc
+
+        changed: list[int] = []
+        try:
+            for item in order["items"]:
+                row = int(item["row_number"])
+                sheet.update_cell(row, status_col, "Approved")
+                sheet.update_cell(row, approved_col, approved_by)
+                sheet.update_cell(row, message_col, str(approval_message_id))
+                changed.append(row)
+        except Exception:
+            for row in changed:
+                sheet.update_cell(row, status_col, "Pending")
+                sheet.update_cell(row, approved_col, "")
+            raise
+
+        order["status"] = "Approved"
+        order["approved_by"] = approved_by
+        order["approval_message_id"] = str(approval_message_id)
+        for item in order["items"]:
+            item["status"] = "Approved"
+            item["approved_by"] = approved_by
+            item["approval_message_id"] = str(approval_message_id)
+        return order
+
+    def archive(
+        self,
+        *,
+        pickup_pin: str,
+        destination_sheet: gspread.Worksheet,
+        destination_name: str,
+        final_status: str,
+        allowed_statuses: set[str],
+        actor_header: str,
+        actor: str,
+        timestamp_header: str,
+        reason_header: str | None = None,
+        reason: str = "",
+        restore_stock: bool = False,
+        discord_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        order = self.service.lookup_by_pin(pickup_pin)
+        if order is None:
+            raise ValueError("No preorder was found for that pickup PIN.")
+        if order["sheet_name"] != "Preorders":
+            raise ValueError(
+                f"This preorder is already archived in {order['sheet_name']}."
+            )
+        if discord_user_id is not None and (
+            str(order["discord_user_id"]) != str(discord_user_id)
+        ):
+            raise ValueError(
+                "This reservation does not belong to your Discord account."
+            )
+
+        current_status = str(order["status"]).strip().casefold()
+        if current_status not in allowed_statuses:
+            allowed = " or ".join(sorted(allowed_statuses))
+            raise ValueError(
+                f"This preorder cannot be changed from '{order['status']}'. "
+                f"It must be {allowed}."
+            )
+
+        source = self.service.preorders_sheet
+        source_headers = source.row_values(1)
+        destination_headers = destination_sheet.row_values(1)
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        archive_rows: list[list[Any]] = []
+
+        for item in order["items"]:
+            values = source.row_values(int(item["row_number"]))
+            values += [""] * max(0, len(source_headers) - len(values))
+            record = dict(zip(source_headers, values))
+            record["Status"] = final_status
+            record[timestamp_header] = occurred_at
+            record[actor_header] = actor
+            if reason_header:
+                record[reason_header] = reason
+            archive_rows.append([record.get(h, "") for h in destination_headers])
+
+        stock_updates = (
+            self.service._prepare_stock_restoration(order["items"])
+            if restore_stock
+            else []
+        )
+        appended = 0
+        try:
+            if stock_updates:
+                self.service._apply_stock_updates(stock_updates)
+            for row in archive_rows:
+                destination_sheet.append_row(
+                    row, value_input_option="USER_ENTERED"
+                )
+                appended += 1
+            for row_number in sorted(
+                (int(i["row_number"]) for i in order["items"]),
+                reverse=True,
+            ):
+                source.delete_rows(row_number)
+        except Exception:
+            for _ in range(appended):
+                destination_sheet.delete_rows(
+                    len(destination_sheet.get_all_values())
+                )
+            if stock_updates:
+                self.service._rollback_stock_updates(stock_updates)
+            raise
+
+        order["status"] = final_status
+        order["sheet_name"] = destination_name
+        order[self.service._key_for_header(timestamp_header)] = occurred_at
+        order[self.service._key_for_header(actor_header)] = actor
+        if reason_header:
+            order[self.service._key_for_header(reason_header)] = reason
+        for item in order["items"]:
+            item["status"] = final_status
+            item["sheet_name"] = destination_name
+            item[self.service._key_for_header(timestamp_header)] = occurred_at
+            item[self.service._key_for_header(actor_header)] = actor
+            if reason_header:
+                item[self.service._key_for_header(reason_header)] = reason
+        return order
+
+
 class SheetsService:
     """Read and write preorder information in Google Sheets."""
 
-    ORDER_HEADERS = [
+    BASE_ORDER_HEADERS = [
         "Timestamp",
         "Discord Username",
         "Discord User ID",
@@ -26,9 +184,16 @@ class SheetsService:
         "Approved By",
         "Approval Message ID",
         "Pickup PIN",
-        "Collected At",
-        "Collected By",
     ]
+    COLLECTED_HEADERS = BASE_ORDER_HEADERS + ["Collected At", "Collected By"]
+    CANCELLED_HEADERS = BASE_ORDER_HEADERS + [
+        "Cancelled At", "Cancelled By", "Cancellation Reason"
+    ]
+    REJECTED_HEADERS = BASE_ORDER_HEADERS + [
+        "Rejected At", "Rejected By", "Rejection Reason"
+    ]
+    ORDER_HEADERS = COLLECTED_HEADERS
+
 
     def __init__(self) -> None:
         try:
@@ -40,6 +205,8 @@ class SheetsService:
             self.products_sheet = self.spreadsheet.worksheet("Products")
             self.preorders_sheet = self.spreadsheet.worksheet("Preorders")
             self.collected_sheet = self.spreadsheet.worksheet("Collected")
+            self.cancelled_sheet = self.spreadsheet.worksheet("Cancelled")
+            self.rejected_sheet = self.spreadsheet.worksheet("Rejected")
 
         except SpreadsheetNotFound as exc:
             raise RuntimeError(
@@ -49,8 +216,8 @@ class SheetsService:
 
         except WorksheetNotFound as exc:
             raise RuntimeError(
-                "The spreadsheet must contain Products, Preorders and "
-                "Collected tabs."
+                "The spreadsheet must contain Products, Preorders, Collected, "
+                "Cancelled and Rejected tabs."
             ) from exc
 
         except APIError as exc:
@@ -58,20 +225,32 @@ class SheetsService:
                 f"Google Sheets API error: {exc}"
             ) from exc
 
-        self._validate_order_headers(self.preorders_sheet, "Preorders")
-        self._validate_order_headers(self.collected_sheet, "Collected")
+        self._validate_order_headers(
+            self.preorders_sheet, "Preorders", self.BASE_ORDER_HEADERS
+        )
+        self._validate_order_headers(
+            self.collected_sheet, "Collected", self.COLLECTED_HEADERS
+        )
+        self._validate_order_headers(
+            self.cancelled_sheet, "Cancelled", self.CANCELLED_HEADERS
+        )
+        self._validate_order_headers(
+            self.rejected_sheet, "Rejected", self.REJECTED_HEADERS
+        )
+        self.order_manager = OrderManager(self)
 
     def _validate_order_headers(
         self,
         worksheet: gspread.Worksheet,
         sheet_name: str,
+        required_headers: list[str],
     ) -> None:
         """Ensure an order worksheet has the required header columns."""
 
         headers = worksheet.row_values(1)
         missing = [
             header
-            for header in self.ORDER_HEADERS
+            for header in required_headers
             if header not in headers
         ]
 
@@ -80,6 +259,10 @@ class SheetsService:
                 f"{sheet_name} sheet is missing required headers: "
                 f"{', '.join(missing)}"
             )
+
+    @staticmethod
+    def _key_for_header(header: str) -> str:
+        return header.strip().lower().replace(" ", "_")
 
     def get_products(self, open_only: bool = False) -> list[dict[str, Any]]:
         """Return valid products from the Products tab."""
@@ -214,8 +397,16 @@ class SheetsService:
             "collected_at": str(
                 record.get("Collected At", "")
             ).strip(),
-            "collected_by": str(
-                record.get("Collected By", "")
+            "collected_by": str(record.get("Collected By", "")).strip(),
+            "cancelled_at": str(record.get("Cancelled At", "")).strip(),
+            "cancelled_by": str(record.get("Cancelled By", "")).strip(),
+            "cancellation_reason": str(
+                record.get("Cancellation Reason", "")
+            ).strip(),
+            "rejected_at": str(record.get("Rejected At", "")).strip(),
+            "rejected_by": str(record.get("Rejected By", "")).strip(),
+            "rejection_reason": str(
+                record.get("Rejection Reason", "")
             ).strip(),
         }
 
@@ -255,18 +446,16 @@ class SheetsService:
         if not pin:
             return None
 
-        items = self._find_items_in_sheet(
-            self.preorders_sheet,
-            "Preorders",
-            pin,
-        )
-
-        if not items:
-            items = self._find_items_in_sheet(
-                self.collected_sheet,
-                "Collected",
-                pin,
-            )
+        items: list[dict[str, Any]] = []
+        for worksheet, sheet_name in (
+            (self.preorders_sheet, "Preorders"),
+            (self.collected_sheet, "Collected"),
+            (self.cancelled_sheet, "Cancelled"),
+            (self.rejected_sheet, "Rejected"),
+        ):
+            items = self._find_items_in_sheet(worksheet, sheet_name, pin)
+            if items:
+                break
 
         if not items:
             return None
@@ -279,13 +468,45 @@ class SheetsService:
             "discord_user_id": first["discord_user_id"],
             "status": first["status"],
             "approved_by": first["approved_by"],
+            "approval_message_id": first["approval_message_id"],
             "timestamp": first["timestamp"],
             "collected_at": first["collected_at"],
             "collected_by": first["collected_by"],
+            "cancelled_at": first["cancelled_at"],
+            "cancelled_by": first["cancelled_by"],
+            "cancellation_reason": first["cancellation_reason"],
+            "rejected_at": first["rejected_at"],
+            "rejected_by": first["rejected_by"],
+            "rejection_reason": first["rejection_reason"],
             "sheet_name": first["sheet_name"],
             "items": items,
             "total_quantity": sum(item["quantity"] for item in items),
         }
+
+    def get_pending_reservation_for_customer(
+        self,
+        discord_user_id: int,
+    ) -> dict[str, Any] | None:
+        """Return the customer's most recently created pending reservation."""
+
+        target_user_id = str(discord_user_id)
+        records = self.preorders_sheet.get_all_records()
+
+        for record in reversed(records):
+            recorded_user_id = str(
+                record.get("Discord User ID", "")
+            ).strip()
+            status = str(record.get("Status", "")).strip().casefold()
+            pickup_pin = str(record.get("Pickup PIN", "")).strip()
+
+            if (
+                recorded_user_id == target_user_id
+                and status == "pending"
+                and pickup_pin
+            ):
+                return self.lookup_by_pin(pickup_pin)
+
+        return None
 
     def approval_already_processed(
         self,
@@ -298,6 +519,8 @@ class SheetsService:
         for worksheet in (
             self.preorders_sheet,
             self.collected_sheet,
+            self.cancelled_sheet,
+            self.rejected_sheet,
         ):
             for record in worksheet.get_all_records():
                 recorded_id = str(
@@ -314,7 +537,7 @@ class SheetsService:
         discord_user_id: int,
         product_id: str,
     ) -> int:
-        """Return the customer's approved and collected quantity."""
+        """Return the customer's pending, approved and collected quantity."""
 
         total = 0
         target_user_id = str(discord_user_id)
@@ -337,7 +560,7 @@ class SheetsService:
                 if (
                     recorded_user_id == target_user_id
                     and recorded_product_id == product_id
-                    and status in {"approved", "collected"}
+                    and status in {"pending", "approved", "collected"}
                 ):
                     try:
                         total += int(record.get("Quantity", 0))
@@ -356,6 +579,333 @@ class SheetsService:
 
             if self.lookup_by_pin(pickup_pin) is None:
                 return pickup_pin
+
+    def _prepare_stock_updates(
+        self,
+        normalized_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Determine the stock changes required for a basket."""
+
+        headers = self.products_sheet.row_values(1)
+
+        try:
+            product_id_column = headers.index("Product ID") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Products sheet is missing Product ID header."
+            ) from exc
+
+        stock_updates: list[dict[str, Any]] = []
+
+        for item in normalized_items:
+            product_cell = self.products_sheet.find(
+                item["product_id"],
+                in_column=product_id_column,
+            )
+
+            if product_cell is None:
+                raise ValueError(
+                    f"Could not locate {item['product_name']} in Products."
+                )
+
+            stock_updates.append(
+                {
+                    "row": product_cell.row,
+                    "old_stock": item["stock"],
+                    "new_stock": item["stock"] - item["quantity"],
+                }
+            )
+
+        return stock_updates
+
+    def _get_stock_column(self) -> int:
+        """Return the one-based Stock column number."""
+
+        headers = self.products_sheet.row_values(1)
+
+        try:
+            return headers.index("Stock") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Products sheet is missing Stock header."
+            ) from exc
+
+    def _apply_stock_updates(
+        self,
+        stock_updates: list[dict[str, Any]],
+    ) -> None:
+        """Apply stock changes to the Products sheet."""
+
+        stock_column = self._get_stock_column()
+
+        for update in stock_updates:
+            self.products_sheet.update_cell(
+                update["row"],
+                stock_column,
+                update["new_stock"],
+            )
+
+    def _rollback_stock_updates(
+        self,
+        stock_updates: list[dict[str, Any]],
+    ) -> None:
+        """Restore stock values after a failed operation."""
+
+        stock_column = self._get_stock_column()
+
+        for update in stock_updates:
+            self.products_sheet.update_cell(
+                update["row"],
+                stock_column,
+                update["old_stock"],
+            )
+
+
+    def _prepare_stock_restoration(
+        self,
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Determine stock increases needed when releasing a reservation."""
+
+        products = {
+            product["product_id"]: product
+            for product in self.get_products(open_only=False)
+        }
+        headers = self.products_sheet.row_values(1)
+
+        try:
+            product_id_column = headers.index("Product ID") + 1
+        except ValueError as exc:
+            raise RuntimeError(
+                "Products sheet is missing Product ID header."
+            ) from exc
+
+        stock_updates: list[dict[str, Any]] = []
+
+        for item in items:
+            product_id = str(item["product_id"])
+            product = products.get(product_id)
+
+            if product is None:
+                raise ValueError(
+                    f"Could not locate {item['product_name']} in Products."
+                )
+
+            product_cell = self.products_sheet.find(
+                product_id,
+                in_column=product_id_column,
+            )
+
+            if product_cell is None:
+                raise ValueError(
+                    f"Could not locate {item['product_name']} in Products."
+                )
+
+            current_stock = int(product["stock"])
+            quantity = int(item["quantity"])
+            stock_updates.append(
+                {
+                    "row": product_cell.row,
+                    "old_stock": current_stock,
+                    "new_stock": current_stock + quantity,
+                }
+            )
+
+        return stock_updates
+
+    def reserve_basket(
+        self,
+        *,
+        discord_username: str,
+        discord_user_id: int,
+        basket: list[dict[str, Any]],
+        approval_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Reserve stock and create a pending preorder under one pickup PIN."""
+
+        if not basket:
+            raise ValueError("The basket is empty.")
+
+        products = {
+            product["product_id"]: product
+            for product in self.get_products()
+        }
+
+        normalized_items: list[dict[str, Any]] = []
+
+        for basket_item in basket:
+            product_id = str(basket_item["product_id"])
+            quantity = int(basket_item["quantity"])
+
+            if quantity < 1:
+                raise ValueError("Quantity must be at least 1.")
+
+            product = products.get(product_id)
+
+            if product is None:
+                raise ValueError(
+                    f"Product {product_id} no longer exists."
+                )
+
+            if not product["preorders_open"]:
+                raise ValueError(
+                    f"Preorders are closed for "
+                    f"{product['product_name']}."
+                )
+
+            if quantity > product["stock"]:
+                raise ValueError(
+                    f"Only {product['stock']} × "
+                    f"{product['product_name']} remain."
+                )
+
+            current_total = self.get_customer_product_total(
+                discord_user_id,
+                product_id,
+            )
+
+            if current_total + quantity > product["customer_limit"]:
+                remaining_limit = max(
+                    product["customer_limit"] - current_total,
+                    0,
+                )
+                raise ValueError(
+                    f"The customer may only order {remaining_limit} more × "
+                    f"{product['product_name']}."
+                )
+
+            normalized_items.append(
+                {
+                    **product,
+                    "quantity": quantity,
+                }
+            )
+
+        stock_updates = self._prepare_stock_updates(
+            normalized_items
+        )
+
+        pickup_pin = self._generate_unique_pin()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        recorded_message_id = (
+            str(approval_message_id)
+            if approval_message_id is not None
+            else ""
+        )
+        appended_rows = 0
+
+        try:
+            self._apply_stock_updates(stock_updates)
+
+            for item in normalized_items:
+                self.preorders_sheet.append_row(
+                    [
+                        timestamp,
+                        discord_username,
+                        str(discord_user_id),
+                        item["product_id"],
+                        item["product_name"],
+                        item["quantity"],
+                        "Pending",
+                        "",
+                        recorded_message_id,
+                        pickup_pin,
+                        "",
+                        "",
+                    ],
+                    value_input_option="USER_ENTERED",
+                )
+                appended_rows += 1
+
+        except Exception:
+            self._rollback_stock_updates(stock_updates)
+
+            for _ in range(appended_rows):
+                self.preorders_sheet.delete_rows(
+                    len(self.preorders_sheet.get_all_values())
+                )
+
+            raise
+
+        reserved_items = []
+
+        for item, update in zip(normalized_items, stock_updates):
+            reserved_items.append(
+                {
+                    **item,
+                    "stock": update["new_stock"],
+                    "status": "Pending",
+                }
+            )
+
+        return {
+            "pickup_pin": pickup_pin,
+            "status": "Pending",
+            "items": reserved_items,
+            "total_quantity": sum(
+                item["quantity"] for item in reserved_items
+            ),
+        }
+
+    def approve_reservation(
+        self,
+        *,
+        pickup_pin: str,
+        approved_by: str,
+        approval_message_id: int,
+    ) -> dict[str, Any]:
+        return self.order_manager.approve(
+            pickup_pin=pickup_pin,
+            approved_by=approved_by,
+            approval_message_id=approval_message_id,
+        )
+
+    def decline_reservation(
+        self,
+        *,
+        pickup_pin: str,
+        declined_by: str,
+        approval_message_id: int,
+        reason: str = "Staff declined reservation",
+    ) -> dict[str, Any]:
+        del approval_message_id
+        return self.order_manager.archive(
+            pickup_pin=pickup_pin,
+            destination_sheet=self.rejected_sheet,
+            destination_name="Rejected",
+            final_status="Rejected",
+            allowed_statuses={"pending"},
+            actor_header="Rejected By",
+            actor=declined_by,
+            timestamp_header="Rejected At",
+            reason_header="Rejection Reason",
+            reason=reason,
+            restore_stock=True,
+        )
+
+    def cancel_reservation(
+        self,
+        *,
+        pickup_pin: str,
+        cancelled_by: str,
+        reason: str = "Customer request",
+        discord_user_id: int | None = None,
+        allowed_statuses: set[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.order_manager.archive(
+            pickup_pin=pickup_pin,
+            destination_sheet=self.cancelled_sheet,
+            destination_name="Cancelled",
+            final_status="Cancelled",
+            allowed_statuses=allowed_statuses or {"pending", "approved"},
+            actor_header="Cancelled By",
+            actor=cancelled_by,
+            timestamp_header="Cancelled At",
+            reason_header="Cancellation Reason",
+            reason=reason,
+            restore_stock=True,
+            discord_user_id=discord_user_id,
+        )
 
     def approve_basket(
         self,
@@ -431,48 +981,16 @@ class SheetsService:
                 }
             )
 
-        headers = self.products_sheet.row_values(1)
-
-        try:
-            product_id_column = headers.index("Product ID") + 1
-            stock_column = headers.index("Stock") + 1
-        except ValueError as exc:
-            raise RuntimeError(
-                "Products sheet is missing Product ID or Stock headers."
-            ) from exc
-
-        stock_updates: list[dict[str, Any]] = []
-
-        for item in normalized_items:
-            product_cell = self.products_sheet.find(
-                item["product_id"],
-                in_column=product_id_column,
-            )
-
-            if product_cell is None:
-                raise ValueError(
-                    f"Could not locate {item['product_name']} in Products."
-                )
-
-            stock_updates.append(
-                {
-                    "row": product_cell.row,
-                    "old_stock": item["stock"],
-                    "new_stock": item["stock"] - item["quantity"],
-                }
-            )
+        stock_updates = self._prepare_stock_updates(
+            normalized_items
+        )
 
         pickup_pin = self._generate_unique_pin()
         timestamp = datetime.now(timezone.utc).isoformat()
         appended_rows = 0
 
         try:
-            for update in stock_updates:
-                self.products_sheet.update_cell(
-                    update["row"],
-                    stock_column,
-                    update["new_stock"],
-                )
+            self._apply_stock_updates(stock_updates)
 
             for item in normalized_items:
                 self.preorders_sheet.append_row(
@@ -495,12 +1013,7 @@ class SheetsService:
                 appended_rows += 1
 
         except Exception:
-            for update in stock_updates:
-                self.products_sheet.update_cell(
-                    update["row"],
-                    stock_column,
-                    update["old_stock"],
-                )
+            self._rollback_stock_updates(stock_updates)
 
             for _ in range(appended_rows):
                 self.preorders_sheet.delete_rows(
@@ -533,77 +1046,17 @@ class SheetsService:
         pickup_pin: str,
         collected_by: str,
     ) -> dict[str, Any]:
-        """Archive all preorder rows sharing the supplied pickup PIN."""
-
-        order = self.lookup_by_pin(pickup_pin)
-
-        if order is None:
-            raise ValueError("No preorder was found for that pickup PIN.")
-
-        if order["sheet_name"] == "Collected":
-            raise ValueError("This preorder has already been collected.")
-
-        if str(order["status"]).strip().casefold() != "approved":
-            raise ValueError(
-                f"This preorder cannot be collected because its status is "
-                f"'{order['status']}'."
-            )
-
-        collected_at = datetime.now(timezone.utc).isoformat()
-        headers = self.preorders_sheet.row_values(1)
-        collected_rows: list[list[Any]] = []
-
-        for item in order["items"]:
-            row_values = self.preorders_sheet.row_values(
-                int(item["row_number"])
-            )
-
-            while len(row_values) < len(headers):
-                row_values.append("")
-
-            row_values[headers.index("Status")] = "Collected"
-            row_values[headers.index("Collected At")] = collected_at
-            row_values[headers.index("Collected By")] = collected_by
-            collected_rows.append(row_values)
-
-        appended_count = 0
-
-        try:
-            for row_values in collected_rows:
-                self.collected_sheet.append_row(
-                    row_values,
-                    value_input_option="USER_ENTERED",
-                )
-                appended_count += 1
-
-            for row_number in sorted(
-                (
-                    int(item["row_number"])
-                    for item in order["items"]
-                ),
-                reverse=True,
-            ):
-                self.preorders_sheet.delete_rows(row_number)
-
-        except Exception:
-            for _ in range(appended_count):
-                self.collected_sheet.delete_rows(
-                    len(self.collected_sheet.get_all_values())
-                )
-            raise
-
-        order["status"] = "Collected"
-        order["collected_at"] = collected_at
-        order["collected_by"] = collected_by
-        order["sheet_name"] = "Collected"
-
-        for item in order["items"]:
-            item["status"] = "Collected"
-            item["collected_at"] = collected_at
-            item["collected_by"] = collected_by
-            item["sheet_name"] = "Collected"
-
-        return order
+        return self.order_manager.archive(
+            pickup_pin=pickup_pin,
+            destination_sheet=self.collected_sheet,
+            destination_name="Collected",
+            final_status="Collected",
+            allowed_statuses={"approved"},
+            actor_header="Collected By",
+            actor=collected_by,
+            timestamp_header="Collected At",
+            restore_stock=False,
+        )
 
     def connection_status(self) -> dict[str, Any]:
         """Return basic spreadsheet connection information."""

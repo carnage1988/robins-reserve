@@ -258,13 +258,19 @@ async def add_to_basket(
 
 
 async def submit_basket(message: discord.Message) -> None:
-    """Send a customer's complete basket to the staff approval channel."""
+    """Reserve a customer's basket and request staff approval."""
 
     basket = customer_baskets.get(message.author.id, [])
 
     if not basket:
         await message.channel.send(
             "Your basket is empty. Send an order code to begin."
+        )
+        return
+
+    if sheets is None:
+        await message.channel.send(
+            "❌ Preorders are temporarily unavailable."
         )
         return
 
@@ -277,10 +283,64 @@ async def submit_basket(message: discord.Message) -> None:
         )
         return
 
+    try:
+        approval_message = await staff_channel.send(
+            "⏳ Reserving preorder stock..."
+        )
+    except discord.HTTPException:
+        logger.exception(
+            "Could not create the staff approval message"
+        )
+        await message.channel.send(
+            "❌ Your preorder could not be submitted."
+        )
+        return
+
+    try:
+        reserved_order = sheets.reserve_basket(
+            discord_username=str(message.author),
+            discord_user_id=message.author.id,
+            basket=[dict(item) for item in basket],
+            approval_message_id=approval_message.id,
+        )
+
+    except ValueError as exc:
+        try:
+            await approval_message.edit(
+                content=f"❌ Reservation failed: {exc}"
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Could not update failed reservation message"
+            )
+
+        await message.channel.send(
+            f"❌ Your preorder could not be reserved: {exc}"
+        )
+        return
+
+    except Exception:
+        logger.exception("Unexpected basket reservation error")
+
+        try:
+            await approval_message.edit(
+                content="❌ The preorder reservation failed."
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Could not update failed reservation message"
+            )
+
+        await message.channel.send(
+            "❌ Your preorder could not be reserved."
+        )
+        return
+
     request_embed = discord.Embed(
-        title="📦 New Preorder Basket",
+        title="📦 Pending Preorder Reservation",
         description=(
-            "React with 👍 to approve the complete basket."
+            "Stock has been reserved from the preorder allocation.\n"
+            "React with 👍 to approve or 👎 to decline the complete basket."
         ),
     )
     request_embed.add_field(
@@ -295,29 +355,43 @@ async def submit_basket(message: discord.Message) -> None:
     )
     request_embed.add_field(
         name="Products",
-        value=format_items(basket),
+        value=format_items(reserved_order["items"]),
         inline=False,
     )
     request_embed.add_field(
         name="Total Items",
-        value=str(
-            sum(int(item["quantity"]) for item in basket)
-        ),
+        value=str(reserved_order["total_quantity"]),
         inline=True,
+    )
+    request_embed.add_field(
+        name="Status",
+        value=reserved_order["status"],
+        inline=True,
+    )
+    request_embed.add_field(
+        name="Reservation PIN",
+        value=f"`{reserved_order['pickup_pin']}`",
+        inline=False,
     )
     request_embed.set_footer(
         text=f"Discord ID: {message.author.id}"
     )
 
-    approval_message = await staff_channel.send(
-        embed=request_embed
-    )
-    await approval_message.add_reaction("👍")
+    try:
+        await approval_message.edit(
+            content=None,
+            embed=request_embed,
+        )
+        await approval_message.add_reaction("👍")
+        await approval_message.add_reaction("👎")
+    except discord.HTTPException:
+        logger.exception(
+            "Reservation was created but the approval message "
+            "could not be fully updated"
+        )
 
     pending_requests[approval_message.id] = {
-        "discord_user_id": message.author.id,
-        "discord_username": str(message.author),
-        "basket": [dict(item) for item in basket],
+        "pickup_pin": reserved_order["pickup_pin"],
     }
     save_pending_requests()
 
@@ -325,8 +399,10 @@ async def submit_basket(message: discord.Message) -> None:
     pending_quantity_requests.pop(message.author.id, None)
 
     await message.channel.send(
-        "✅ Your basket has been sent for staff approval.\n\n"
-        f"{format_items(basket)}"
+        "✅ **Your preorder stock has been reserved.**\n\n"
+        f"{format_items(reserved_order['items'])}\n\n"
+        "Your reservation is now awaiting staff approval. "
+        "Your pickup PIN will be sent once the preorder is approved."
     )
 
 
@@ -349,11 +425,118 @@ async def process_preorder_dm(message: discord.Message) -> None:
     content = message.content.strip()
     command = content.casefold()
 
-    if command == "cancel":
-        pending_quantity_requests.pop(message.author.id, None)
-        customer_baskets.pop(message.author.id, None)
+    cancel_parts = content.split(maxsplit=1)
+    is_cancel_command = cancel_parts[0].casefold() == "cancel"
+
+    if is_cancel_command:
+        supplied_pin = (
+            cancel_parts[1].strip() if len(cancel_parts) == 2 else ""
+        )
+
+        if not supplied_pin:
+            had_quantity_prompt = (
+                pending_quantity_requests.pop(message.author.id, None)
+                is not None
+            )
+            had_basket = (
+                customer_baskets.pop(message.author.id, None)
+                is not None
+            )
+
+            if had_quantity_prompt or had_basket:
+                await message.channel.send(
+                    "Your preorder basket was cleared."
+                )
+                return
+
+            try:
+                pending_order = sheets.get_pending_reservation_for_customer(
+                    message.author.id
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to check for a pending customer reservation"
+                )
+                await message.channel.send(
+                    "❌ I could not check your pending reservations."
+                )
+                return
+
+            if pending_order is None:
+                await message.channel.send(
+                    "You do not have a basket or pending reservation to "
+                    "cancel. For an approved order, send "
+                    "**CANCEL <pickup PIN>**."
+                )
+                return
+
+            supplied_pin = str(pending_order["pickup_pin"])
+            allowed_statuses = {"pending"}
+        else:
+            allowed_statuses = {"pending", "approved"}
+
+        try:
+            cancelled_order = sheets.cancel_reservation(
+                pickup_pin=supplied_pin,
+                discord_user_id=message.author.id,
+                cancelled_by=str(message.author),
+                reason="Customer request",
+                allowed_statuses=allowed_statuses,
+            )
+        except ValueError as exc:
+            await message.channel.send(f"❌ {exc}")
+            return
+        except Exception:
+            logger.exception("Unexpected preorder cancellation error")
+            await message.channel.send(
+                "❌ Your preorder reservation could not be cancelled."
+            )
+            return
+
+        approval_message_id_text = str(
+            cancelled_order.get("approval_message_id", "")
+        ).strip()
+
+        if approval_message_id_text.isdigit():
+            approval_message_id = int(approval_message_id_text)
+            pending_requests.pop(approval_message_id, None)
+            save_pending_requests()
+
+            staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
+            if isinstance(staff_channel, discord.TextChannel):
+                try:
+                    approval_message = await staff_channel.fetch_message(
+                        approval_message_id
+                    )
+                    cancelled_embed = discord.Embed(
+                        title="🚫 Preorder Cancelled by Customer",
+                        description=(
+                            "Reserved stock has been returned and the order "
+                            "has been moved to the Cancelled sheet.\n"
+                            f"Pickup PIN: `{cancelled_order['pickup_pin']}`"
+                        ),
+                    )
+                    cancelled_embed.add_field(
+                        name="Customer",
+                        value=str(message.author),
+                        inline=False,
+                    )
+                    cancelled_embed.add_field(
+                        name="Products",
+                        value=format_items(cancelled_order["items"]),
+                        inline=False,
+                    )
+                    await approval_message.reply(embed=cancelled_embed)
+                except discord.HTTPException:
+                    logger.warning(
+                        "Could not update the cancelled approval message"
+                    )
+
         await message.channel.send(
-            "Your preorder basket was cleared."
+            "🚫 **Your preorder has been cancelled.**\n\n"
+            f"{format_items(cancelled_order['items'])}\n\n"
+            "The reserved stock has been returned to the preorder "
+            "allocation."
         )
         return
 
@@ -468,8 +651,10 @@ async def on_message(message: discord.Message) -> None:
 
     if message.author.bot:
         return
+    
+    is_command = message.content.lstrip().startswith("!")
 
-    if message.guild is None:
+    if message.guild is None and not is_command:
         await process_preorder_dm(message)
 
     await bot.process_commands(message)
@@ -479,7 +664,7 @@ async def on_message(message: discord.Message) -> None:
 async def on_raw_reaction_add(
     payload: discord.RawReactionActionEvent,
 ) -> None:
-    """Approve a complete preorder basket with one pickup PIN."""
+    """Approve or decline an existing pending preorder reservation."""
 
     if bot.user is None or payload.user_id == bot.user.id:
         return
@@ -487,21 +672,23 @@ async def on_raw_reaction_add(
     if payload.channel_id != STAFF_CHANNEL_ID:
         return
 
-    if str(payload.emoji) != "👍":
+    reaction = str(payload.emoji)
+
+    if reaction not in {"👍", "👎"}:
         return
 
     request = pending_requests.get(payload.message_id)
 
     if request is None:
         logger.warning(
-            "No pending request found for approval message %s",
+            "No pending request found for reservation message %s",
             payload.message_id,
         )
         return
 
     if sheets is None:
         logger.error(
-            "Cannot approve preorder: Google Sheets unavailable"
+            "Cannot process preorder reservation: Google Sheets unavailable"
         )
         return
 
@@ -536,7 +723,7 @@ async def on_raw_reaction_add(
 
     if not has_staff_role:
         logger.warning(
-            "Unauthorised approval attempt by %s (%s)",
+            "Unauthorised reservation action by %s (%s)",
             approver,
             approver.id,
         )
@@ -554,7 +741,7 @@ async def on_raw_reaction_add(
                 )
                 await channel.send(
                     f"⚠️ {approver.mention} is not authorised "
-                    "to approve preorders."
+                    "to approve or decline preorders."
                 )
             except discord.HTTPException:
                 logger.warning(
@@ -563,101 +750,186 @@ async def on_raw_reaction_add(
 
         return
 
-    approved_by = approver.display_name
+    staff_member = approver.display_name
+    pickup_pin = str(request["pickup_pin"])
 
-    try:
-        approved_order = sheets.approve_basket(
-            discord_username=str(
-                request["discord_username"]
-            ),
-            discord_user_id=int(
-                request["discord_user_id"]
-            ),
-            basket=list(request["basket"]),
-            approved_by=approved_by,
-            approval_message_id=payload.message_id,
-        )
-
-    except ValueError as exc:
-        channel = bot.get_channel(payload.channel_id)
-
-        if isinstance(channel, discord.TextChannel):
-            await channel.send(
-                f"❌ Could not approve preorder: {exc}"
-            )
-        return
-
-    except Exception:
-        logger.exception(
-            "Unexpected preorder basket approval error"
-        )
-        channel = bot.get_channel(payload.channel_id)
-
-        if isinstance(channel, discord.TextChannel):
-            await channel.send(
-                "❌ The preorder basket could not be approved."
-            )
-        return
-
-    try:
-        customer = await bot.fetch_user(
-            int(request["discord_user_id"])
-        )
-        await customer.send(
-            "✅ **Robin's Reserve Preorder Approved**\n\n"
-            f"{format_items(approved_order['items'])}\n\n"
-            f"🔐 Pickup PIN: "
-            f"**{approved_order['pickup_pin']}**\n\n"
-            "Please show this PIN when collecting the order."
-        )
-    except discord.HTTPException:
-        logger.warning(
-            "Could not send confirmation DM to user %s",
-            request["discord_user_id"],
-        )
-
-    channel = bot.get_channel(payload.channel_id)
-
-    if isinstance(channel, discord.TextChannel):
+    if reaction == "👍":
         try:
-            approval_message = await channel.fetch_message(
-                payload.message_id
-            )
-            approved_embed = discord.Embed(
-                title="✅ Preorder Basket Approved",
-                description=(
-                    f"Pickup PIN: "
-                    f"`{approved_order['pickup_pin']}`"
-                ),
-            )
-            approved_embed.add_field(
-                name="Products",
-                value=format_items(
-                    approved_order["items"]
-                ),
-                inline=False,
-            )
-            approved_embed.add_field(
-                name="Total Items",
-                value=str(
-                    approved_order["total_quantity"]
-                ),
-                inline=True,
-            )
-            approved_embed.add_field(
-                name="Approved By",
-                value=approved_by,
-                inline=False,
+            processed_order = sheets.approve_reservation(
+                pickup_pin=pickup_pin,
+                approved_by=staff_member,
+                approval_message_id=payload.message_id,
             )
 
-            await approval_message.reply(
-                embed=approved_embed
-            )
+        except ValueError as exc:
+            channel = bot.get_channel(payload.channel_id)
 
-        except discord.HTTPException:
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    f"❌ Could not approve preorder: {exc}"
+                )
+            return
+
+        except Exception:
             logger.exception(
-                "Could not update the approval message"
+                "Unexpected preorder basket approval error"
             )
+            channel = bot.get_channel(payload.channel_id)
+
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    "❌ The preorder basket could not be approved."
+                )
+            return
+
+        try:
+            customer = await bot.fetch_user(
+                int(processed_order["discord_user_id"])
+            )
+            await customer.send(
+                "✅ **Robin's Reserve Preorder Approved**\n\n"
+                f"{format_items(processed_order['items'])}\n\n"
+                f"🔐 Pickup PIN: "
+                f"**{processed_order['pickup_pin']}**\n\n"
+                "Please show this PIN when collecting the order."
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Could not send confirmation DM to user %s",
+                processed_order["discord_user_id"],
+            )
+
+        channel = bot.get_channel(payload.channel_id)
+
+        if isinstance(channel, discord.TextChannel):
+            try:
+                approval_message = await channel.fetch_message(
+                    payload.message_id
+                )
+                approved_embed = discord.Embed(
+                    title="✅ Preorder Basket Approved",
+                    description=(
+                        f"Pickup PIN: "
+                        f"`{processed_order['pickup_pin']}`"
+                    ),
+                )
+                approved_embed.add_field(
+                    name="Products",
+                    value=format_items(
+                        processed_order["items"]
+                    ),
+                    inline=False,
+                )
+                approved_embed.add_field(
+                    name="Total Items",
+                    value=str(
+                        processed_order["total_quantity"]
+                    ),
+                    inline=True,
+                )
+                approved_embed.add_field(
+                    name="Approved By",
+                    value=staff_member,
+                    inline=False,
+                )
+
+                await approval_message.reply(
+                    embed=approved_embed
+                )
+
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not update the approval message"
+                )
+
+    else:
+        try:
+            processed_order = sheets.decline_reservation(
+                pickup_pin=pickup_pin,
+                declined_by=staff_member,
+                approval_message_id=payload.message_id,
+            )
+
+        except ValueError as exc:
+            channel = bot.get_channel(payload.channel_id)
+
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    f"❌ Could not reject preorder: {exc}"
+                )
+            return
+
+        except Exception:
+            logger.exception(
+                "Unexpected preorder basket decline error"
+            )
+            channel = bot.get_channel(payload.channel_id)
+
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    "❌ The preorder basket could not be rejected."
+                )
+            return
+
+        try:
+            customer = await bot.fetch_user(
+                int(processed_order["discord_user_id"])
+            )
+            await customer.send(
+                "❌ **Robin's Reserve Preorder Rejected**\n\n"
+                f"{format_items(processed_order['items'])}\n\n"
+                "The reserved stock has been returned to the preorder "
+                "allocation. No pickup PIN has been issued."
+            )
+        except discord.HTTPException:
+            logger.warning(
+                "Could not send decline DM to user %s",
+                processed_order["discord_user_id"],
+            )
+
+        channel = bot.get_channel(payload.channel_id)
+
+        if isinstance(channel, discord.TextChannel):
+            try:
+                approval_message = await channel.fetch_message(
+                    payload.message_id
+                )
+                declined_embed = discord.Embed(
+                    title="❌ Preorder Basket Rejected",
+                    description=(
+                        "Reserved stock has been returned.\n"
+                        f"Reservation PIN: "
+                        f"`{processed_order['pickup_pin']}`"
+                    ),
+                )
+                declined_embed.add_field(
+                    name="Products",
+                    value=format_items(
+                        processed_order["items"]
+                    ),
+                    inline=False,
+                )
+                declined_embed.add_field(
+                    name="Total Items",
+                    value=str(
+                        processed_order["total_quantity"]
+                    ),
+                    inline=True,
+                )
+                declined_embed.add_field(
+                    name="Rejected By",
+                    value=staff_member,
+                    inline=False,
+                )
+
+                await approval_message.reply(
+                    embed=declined_embed
+                )
+
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not update the rejection message"
+                )
 
     pending_requests.pop(payload.message_id, None)
     save_pending_requests()
@@ -668,7 +940,7 @@ async def lookup(
     ctx: commands.Context,
     pickup_pin: str = "",
 ) -> None:
-    """Look up an active or collected preorder basket by PIN."""
+    """Look up an order across active and archive sheets by PIN."""
 
     if not is_staff_channel(ctx):
         await ctx.send(
@@ -752,6 +1024,110 @@ async def lookup(
             inline=False,
         )
 
+    elif str(order["status"]).casefold() == "cancelled":
+        embed.add_field(
+            name="Cancelled By",
+            value=order.get("cancelled_by") or "Unknown",
+            inline=False,
+        )
+        embed.add_field(
+            name="Cancelled At",
+            value=format_datetime(order.get("cancelled_at", "")),
+            inline=False,
+        )
+        embed.add_field(
+            name="Reason",
+            value=order.get("cancellation_reason") or "Not provided",
+            inline=False,
+        )
+    elif str(order["status"]).casefold() == "rejected":
+        embed.add_field(
+            name="Rejected By",
+            value=order.get("rejected_by") or "Unknown",
+            inline=False,
+        )
+        embed.add_field(
+            name="Rejected At",
+            value=format_datetime(order.get("rejected_at", "")),
+            inline=False,
+        )
+        embed.add_field(
+            name="Reason",
+            value=order.get("rejection_reason") or "Not provided",
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="cancel")
+async def staff_cancel(
+    ctx: commands.Context,
+    pickup_pin: str = "",
+    *,
+    reason: str = "Customer request received by staff",
+) -> None:
+    """Cancel a pending or approved order and return reserved stock."""
+
+    if not is_staff_channel(ctx):
+        await ctx.send(
+            "❌ This command can only be used in the staff approval channel."
+        )
+        return
+    if not pickup_pin:
+        await ctx.send("Usage: `!cancel <pickup PIN> [reason]`")
+        return
+    if sheets is None:
+        await ctx.send("❌ Google Sheets is not connected.")
+        return
+
+    try:
+        order = sheets.cancel_reservation(
+            pickup_pin=pickup_pin,
+            cancelled_by=str(ctx.author),
+            reason=reason,
+            allowed_statuses={"pending", "approved"},
+        )
+    except ValueError as exc:
+        await ctx.send(f"❌ {exc}")
+        return
+    except Exception:
+        logger.exception("Unable to cancel preorder")
+        await ctx.send("❌ The preorder could not be cancelled.")
+        return
+
+    approval_message_id_text = str(
+        order.get("approval_message_id", "")
+    ).strip()
+    if approval_message_id_text.isdigit():
+        pending_requests.pop(int(approval_message_id_text), None)
+        save_pending_requests()
+
+    try:
+        customer = await bot.fetch_user(int(order["discord_user_id"]))
+        await customer.send(
+            "🚫 **Robin's Reserve Preorder Cancelled**\n\n"
+            f"{format_items(order['items'])}\n\n"
+            f"Reason: **{reason}**\n\n"
+            "The reserved stock has been returned."
+        )
+    except (ValueError, discord.HTTPException):
+        logger.warning(
+            "Could not send cancellation notice to user %s",
+            order["discord_user_id"],
+        )
+
+    embed = discord.Embed(
+        title="🚫 Preorder Cancelled by Staff",
+        description=f"Pickup PIN: `{order['pickup_pin']}`",
+    )
+    embed.add_field(
+        name="Products", value=format_items(order["items"]), inline=False
+    )
+    embed.add_field(
+        name="Cancelled By", value=str(ctx.author), inline=False
+    )
+    embed.add_field(name="Reason", value=reason, inline=False)
     await ctx.send(embed=embed)
 
 

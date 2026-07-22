@@ -2,15 +2,26 @@
 
 > A production-ready Discord bot for managing Pokémon TCG preorders for independent hobby stores.
 
-Robin's Reserve automates the preorder process by allowing customers to submit requests via Discord Direct Messages while staff approve, manage and fulfil reservations using Google Sheets as the backend database.
+Robin's Reserve automates the preorder process by allowing customers to submit requests via Discord Direct Messages while staff approve, reject, cancel and fulfil reservations using Google Sheets as the backend database.
 
-The project was designed to reduce manual administration, improve stock accuracy and provide a simple workflow that can be used by hobby stores without requiring additional software.
+The bot manages the complete preorder lifecycle from reservation through to collection, cancellation or rejection while maintaining accurate stock levels and a full audit trail.
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/carnage1988/robins-reserve.git
+cd robins-reserve
+cp .env.example .env
+docker compose up -d --build
+```
 
 ---
 
 # Current Status
 
-**Version:** v1.0.0
+**Version:** v1.1.0
 
 **Status:** Production
 
@@ -25,11 +36,15 @@ The project was designed to reduce manual administration, improve stock accuracy
 - Automatic collection PIN generation
 - Customer notifications when an order is approved
 - Customer notifications when an order is collected
+- Cancel pending reservations
+- Cancel approved reservations using the pickup PIN
 
 ## Staff Workflow
 
 - Approve orders using Discord reactions
-- Automatic stock deduction
+- Reject orders using Discord reactions
+- Cancel approved reservations
+- Automatic stock management
 - Lookup reservations using:
 
 ```text
@@ -41,8 +56,16 @@ The project was designed to reduce manual administration, improve stock accuracy
 ```text
 !collect <PIN>
 ```
+- Cancel approved reservations using:
 
-- Automatic archive of collected orders
+```text
+!cancel <PIN> [reason]
+```
+
+- Automatic archiving of:
+  - Collected orders
+  - Cancelled orders
+  - Rejected orders
 
 ## Backend
 
@@ -52,6 +75,8 @@ The project was designed to reduce manual administration, improve stock accuracy
 - Environment variable configuration
 - Docker support
 - Docker Compose deployment
+- Order lifecycle management
+- Centralised OrderManager
 
 ---
 
@@ -66,9 +91,18 @@ The project was designed to reduce manual administration, improve stock accuracy
                         ▼
                Robin's Reserve Bot
                         │
-        ┌───────────────┼────────────────┐
-        ▼               ▼                ▼
- Google Sheets      Persistent Data     Logs
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+  Google Sheets   Pending Requests    Logs
+         │
+         ▼
+ ┌───────────────────────────────┐
+ │ Products                      │
+ │ Preorders                     │
+ │ Collected                     │
+ │ Cancelled                     │
+ │ Rejected                      │
+ └───────────────────────────────┘
 ```
 
 ---
@@ -90,7 +124,7 @@ discord-preorder-bot/
 │
 ├── bot.py
 ├── config.py
-├── sheets_service.py
+├── sheets_service.py      # Google Sheets + OrderManager
 ├── Dockerfile
 ├── compose.yaml
 ├── requirements.txt
@@ -130,6 +164,16 @@ Populate the following values:
 - Google Sheet ID
 - Staff Channel ID
 - Staff Role ID
+
+## Required Google Sheets
+
+Robin's Reserve expects the following worksheets within the configured spreadsheet:
+
+- Products
+- Preorders
+- Collected
+- Cancelled
+- Rejected
 
 Place the Google Service Account JSON inside:
 
@@ -173,25 +217,40 @@ Mark an order as collected
 !collect <PIN>
 ```
 
+Cancel an approved order
+
+```text
+!cancel <PIN> [reason]
+```
+
+---
+
+# Order Lifecycle
+
+Each reservation progresses through a defined lifecycle while maintaining stock accuracy and a complete audit trail across Google Sheets.
+
+```text
+Pending
+├── Approved
+│   ├── Collected
+│   └── Cancelled
+└── Rejected
+```
+
 ---
 
 # Roadmap
 
-## v1.1.0
 
-- Order decline workflow
-- Order cancellation
-- Stock restoration
-- Improved staff notifications
+## v1.2.0
+
+- Improved search commands
+- Enhanced reporting
 
 ## Future
 
-- Inventory management commands
-- Customer self-cancellation
-- Payment integration
 - Reservation expiry
 - Web dashboard
-- Multi-store support
 
 ---
 
