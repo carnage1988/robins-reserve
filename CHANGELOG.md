@@ -1,3 +1,31 @@
+# v1.2.0 - 27/07/2026
+
+## Added
+
+- Pokémon League attendance management
+- Staff-only `/league start`, `/league end`, `/league status` and `/league checkin` commands
+- Player `/linkplayer`, `/unlinkplayer`, `/leaguecheckin` and `/leaguestatus` commands
+- Time-limited in-store check-in codes
+- Dedicated League check-in Discord channel support
+- Google Sheets-backed League players, events and attendance records
+- Automatic League Player role assignment after a successful check-in
+- Daily role reconciliation using a rolling attendance window
+- Duplicate event check-in prevention
+- Staff manual check-in fallback
+
+## Changed
+
+- Slash commands are now synchronised globally and to the configured Robins guild
+- League event expiry and role retention periods are configurable through environment variables
+- League command permission and channel validation is centralised
+- League service now provides event status, attendance totals and role reconciliation data
+
+## Fixed
+
+- Expired League events are automatically marked inactive
+- Closing an event now returns its updated end time and inactive state
+- Removed duplicate unreachable return statement from the League service
+
 # v1.1.0 - 22/07/2026
 
 ## Added

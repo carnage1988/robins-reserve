@@ -35,6 +35,15 @@ GOOGLE_SHEET_ID = require_env("GOOGLE_SHEET_ID")
 STAFF_CHANNEL_ID = require_int_env("STAFF_CHANNEL_ID")
 STAFF_ROLE_ID = require_int_env("STAFF_ROLE_ID")
 
+LEAGUE_GUILD_ID = require_int_env("LEAGUE_GUILD_ID")
+LEAGUE_CHANNEL_ID = require_int_env("LEAGUE_CHANNEL_ID")
+LEAGUE_ROLE_ID = require_int_env("LEAGUE_ROLE_ID")
+LEAGUE_WINDOW_DAYS = int(
+    os.getenv("LEAGUE_WINDOW_DAYS", "30")
+)
+LEAGUE_EVENT_DURATION_HOURS = int(
+    os.getenv("LEAGUE_EVENT_DURATION_HOURS", "4")
+)
 
 GOOGLE_CREDENTIALS_FILE = Path(
     os.getenv(

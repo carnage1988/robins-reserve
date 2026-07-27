@@ -21,7 +21,7 @@ docker compose up -d --build
 
 # Current Status
 
-**Version:** v1.1.0
+**Version:** v1.2.0
 
 **Status:** Production
 
@@ -125,6 +125,7 @@ discord-preorder-bot/
 ├── bot.py
 ├── config.py
 ├── sheets_service.py      # Google Sheets + OrderManager
+├── league_service.py      # League events, attendance and role state
 ├── Dockerfile
 ├── compose.yaml
 ├── requirements.txt
@@ -164,6 +165,11 @@ Populate the following values:
 - Google Sheet ID
 - Staff Channel ID
 - Staff Role ID
+- League Guild ID
+- League Channel ID
+- League Player Role ID
+- League attendance window
+- League event duration
 
 ## Required Google Sheets
 
@@ -174,6 +180,9 @@ Robin's Reserve expects the following worksheets within the configured spreadshe
 - Collected
 - Cancelled
 - Rejected
+- League Players
+- League Events
+- League Attendance
 
 Place the Google Service Account JSON inside:
 
@@ -225,6 +234,28 @@ Cancel an approved order
 
 ---
 
+## Pokémon League Workflow
+
+Staff manage in-store League sessions from the configured League channel:
+
+```text
+/league start
+/league end
+/league status
+/league checkin @member
+```
+
+Players link their Play! Pokémon Player ID and check in using the code displayed inside Robins:
+
+```text
+/linkplayer <player_id>
+/leaguecheckin <store_code>
+/leaguestatus
+/unlinkplayer
+```
+
+A successful check-in records attendance in Google Sheets and adds or renews the configured League Player role. A daily reconciliation removes the role when the player's last attendance falls outside the configured rolling window.
+
 # Order Lifecycle
 
 Each reservation progresses through a defined lifecycle while maintaining stock accuracy and a complete audit trail across Google Sheets.
@@ -242,12 +273,10 @@ Pending
 # Roadmap
 
 
-## v1.2.0
+## Future
 
 - Improved search commands
 - Enhanced reporting
-
-## Future
 
 - Reservation expiry
 - Web dashboard
