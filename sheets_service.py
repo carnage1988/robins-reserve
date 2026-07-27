@@ -193,7 +193,30 @@ class SheetsService:
         "Rejected At", "Rejected By", "Rejection Reason"
     ]
     ORDER_HEADERS = COLLECTED_HEADERS
+    
+    LEAGUE_PLAYER_HEADERS = [
+        "Discord User ID",
+        "Discord Name",
+        "Player ID",
+        "Last Attendance",
+        "Role Active",
+        "Linked At",
+    ]
 
+    LEAGUE_EVENT_HEADERS = [
+        "Event ID",
+        "Store Code",
+        "Start Time",
+        "End Time",
+        "Active",
+    ]
+
+    LEAGUE_ATTENDANCE_HEADERS = [
+        "Event ID",
+        "Discord User ID",
+        "Player ID",
+        "Checked In At",
+    ]
 
     def __init__(self) -> None:
         try:
@@ -208,10 +231,22 @@ class SheetsService:
             self.cancelled_sheet = self.spreadsheet.worksheet("Cancelled")
             self.rejected_sheet = self.spreadsheet.worksheet("Rejected")
 
+            self.league_players_sheet = self.spreadsheet.worksheet(
+                "League Players"
+            )
+            self.league_events_sheet = self.spreadsheet.worksheet(
+                "League Events"
+            )
+            self.league_attendance_sheet = self.spreadsheet.worksheet(
+                "League Attendance"
+            )
+
         except SpreadsheetNotFound as exc:
             raise RuntimeError(
-                "Spreadsheet not found. Check GOOGLE_SHEET_ID and confirm "
-                "the spreadsheet is shared with the service account."
+                "The spreadsheet must contain Products, Preorders, Collected, "
+                "Cancelled, Rejected, League Players, League Events and "
+                "League Attendance tabs."
+                
             ) from exc
 
         except WorksheetNotFound as exc:
@@ -237,8 +272,25 @@ class SheetsService:
         self._validate_order_headers(
             self.rejected_sheet, "Rejected", self.REJECTED_HEADERS
         )
-        self.order_manager = OrderManager(self)
 
+        self._validate_order_headers(
+            self.league_players_sheet,
+            "League Players",
+            self.LEAGUE_PLAYER_HEADERS,
+        )
+        self._validate_order_headers(
+            self.league_events_sheet,
+            "League Events",
+            self.LEAGUE_EVENT_HEADERS,
+        )
+        self._validate_order_headers(
+            self.league_attendance_sheet,
+            "League Attendance",
+            self.LEAGUE_ATTENDANCE_HEADERS,
+        )
+
+        self.order_manager = OrderManager(self) 
+        
     def _validate_order_headers(
         self,
         worksheet: gspread.Worksheet,
