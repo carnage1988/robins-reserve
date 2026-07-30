@@ -253,6 +253,7 @@ async def add_to_basket(
                 "product_name": product["product_name"],
                 "order_code": product["order_code"],
                 "quantity": quantity,
+                "league_only": product.get("league_only", False),
             }
         )
 
@@ -274,6 +275,25 @@ async def submit_basket(message: discord.Message) -> None:
             "Your basket is empty. Send an order code to begin."
         )
         return
+
+    contains_league_product = any(
+        item.get("league_only", False)
+        for item in basket
+    )
+
+    if contains_league_product:
+        if not await has_league_role(message.author.id):
+            logger.info(
+                "Blocked League-only basket submission for user %s",
+                message.author.id,
+            )
+            await message.channel.send(
+                "❌ Your basket contains a Pokémon League-only product, "
+                "but I could not verify that you currently have the "
+                "**Pokémon League** role.\n\n"
+                "Your basket has not been submitted."
+            )
+            return
 
     if sheets is None:
         await message.channel.send(
@@ -594,6 +614,18 @@ async def process_preorder_dm(message: discord.Message) -> None:
         )
         return
 
+    if product is not None and product.get("league_only", False):
+        if not await has_league_role(message.author.id):
+            logger.info(
+                "Blocked League-only product access for user %s",
+                message.author.id,
+            )
+            await message.channel.send(
+                "❌ This preorder is available only to members with the "
+                "**Pokémon League** role."
+            )
+            return
+
     if product is not None and not product["preorders_open"]:
         await message.channel.send(
             f"🚫 Preorders for **{product['product_name']}** "
@@ -609,6 +641,14 @@ async def process_preorder_dm(message: discord.Message) -> None:
         except Exception:
             logger.exception("Unable to search order codes")
             return
+
+        if matches:
+            has_role = await has_league_role(message.author.id)
+            matches = [
+                match
+                for match in matches
+                if not match.get("league_only", False) or has_role
+            ]
 
         if matches:
             codes = "\n".join(
@@ -1293,6 +1333,17 @@ async def products(ctx: commands.Context) -> None:
         )
         return
 
+    if any(
+        product.get("league_only", False)
+        for product in available_products
+    ):
+        has_role = await has_league_role(ctx.author.id)
+        available_products = [
+            product
+            for product in available_products
+            if not product.get("league_only", False) or has_role
+        ]
+
     if not available_products:
         await ctx.send(
             "There are currently no open preorders."
@@ -1372,6 +1423,41 @@ def get_league_guild() -> discord.Guild | None:
     """Return the configured Robins guild when available."""
 
     return bot.get_guild(LEAGUE_GUILD_ID)
+
+
+async def has_league_role(discord_user_id: int) -> bool:
+    """Return whether a Discord user currently has the League role."""
+
+    guild = get_league_guild()
+    if guild is None:
+        logger.error(
+            "Could not verify League access because guild %s is unavailable",
+            LEAGUE_GUILD_ID,
+        )
+        return False
+
+    member = guild.get_member(discord_user_id)
+
+    if member is None:
+        try:
+            member = await guild.fetch_member(discord_user_id)
+        except discord.NotFound:
+            logger.info(
+                "League access denied because user %s is not in the guild",
+                discord_user_id,
+            )
+            return False
+        except discord.HTTPException:
+            logger.exception(
+                "Could not verify League role for user %s",
+                discord_user_id,
+            )
+            return False
+
+    return any(
+        role.id == LEAGUE_ROLE_ID
+        for role in member.roles
+    )
 
 
 async def validate_league_staff(

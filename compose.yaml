@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
 
-    image: robins-reserve:1.0.0
+    image: robins-reserve:1.2.1
     container_name: robins-reserve
 
     restart: unless-stopped
