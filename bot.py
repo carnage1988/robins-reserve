@@ -21,6 +21,7 @@ from config import (
     STAFF_ROLE_ID,
 )
 from league_service import LeagueService
+from robincon_service import RobinConService
 from sheets_service import SheetsService
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -142,6 +143,13 @@ except Exception:
     logger.exception("Google Sheets connection failed")
     sheets = None
     league_service = None
+
+try:
+    robincon_service = RobinConService()
+except Exception:
+    logger.exception("RobinCon connection failed")
+    robincon_service = None
+
 
 def is_staff_channel(ctx: commands.Context) -> bool:
     """Return True when a command is used in the staff approval channel."""
@@ -1963,6 +1971,70 @@ async def league_staff_checkin(
 
 
 bot.tree.add_command(league_group)
+
+
+@bot.tree.command(
+    name="robincon-status",
+    description="Check the RobinCon service connection.",
+)
+async def robincon_status(
+    interaction: discord.Interaction,
+) -> None:
+    """Show the current RobinCon workbook connection status."""
+
+    if robincon_service is None:
+        await interaction.response.send_message(
+            "❌ RobinCon is not connected. Check the bot logs.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        status = robincon_service.get_status()
+    except Exception:
+        logger.exception("Unable to retrieve RobinCon status")
+        await interaction.followup.send(
+            "❌ The RobinCon workbook could not be read. Check the bot logs.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🎟️ RobinCon Service Status",
+        description=f"**{status['robincon_name']}**",
+    )
+    embed.add_field(
+        name="Workbook",
+        value="✅ Connected",
+        inline=True,
+    )
+    embed.add_field(
+        name="Configuration Values",
+        value=str(status["configuration_count"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Active Ticket Types",
+        value=str(status["ticket_type_count"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Enabled T-Shirt Sizes",
+        value=str(status["tshirt_size_count"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Open Premium Events",
+        value=str(status["premium_event_count"]),
+        inline=True,
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+    )
 
 
 @tasks.loop(hours=24)

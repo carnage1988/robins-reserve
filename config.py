@@ -31,6 +31,7 @@ def require_int_env(name: str) -> int:
 
 DISCORD_BOT_TOKEN = require_env("DISCORD_BOT_TOKEN")
 GOOGLE_SHEET_ID = require_env("GOOGLE_SHEET_ID")
+ROBINCON_SHEET_ID = os.getenv("ROBINCON_SHEET_ID", "").strip()
 
 STAFF_CHANNEL_ID = require_int_env("STAFF_CHANNEL_ID")
 STAFF_ROLE_ID = require_int_env("STAFF_ROLE_ID")
