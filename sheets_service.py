@@ -360,6 +360,17 @@ class SheetsService:
                 "1",
             }
 
+            league_only_value = str(
+                record.get("League Only", "")
+            ).strip().upper()
+
+            league_only = league_only_value in {
+                "TRUE",
+                "YES",
+                "Y",
+                "1",
+            }
+
             product = {
                 "product_id": product_id,
                 "product_name": product_name,
@@ -369,6 +380,7 @@ class SheetsService:
                 "stock": stock,
                 "customer_limit": customer_limit,
                 "preorders_open": preorders_open,
+                "league_only": league_only,
             }
 
             if open_only and not preorders_open:

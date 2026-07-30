@@ -21,7 +21,7 @@ RUN pip install \
        --no-cache-dir \
        -r requirements.txt
 
-COPY bot.py config.py sheets_service.py ./
+COPY bot.py config.py sheets_service.py league_service.py ./
 
 RUN mkdir -p /app/data /app/logs /app/secrets \
     && chown -R robinsreserve:robinsreserve /app
