@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -1973,6 +1974,409 @@ async def league_staff_checkin(
 bot.tree.add_command(league_group)
 
 
+def build_robincon_linked_embed(ticket: dict[str, Any]) -> discord.Embed:
+    """Build the private confirmation shown after a ticket is linked."""
+
+    embed = discord.Embed(
+        title="✅ RobinCon Ticket Linked",
+        description=(
+            "Your Discord account is now linked to this RobinCon ticket."
+        ),
+    )
+    embed.add_field(
+        name="Ticket ID",
+        value=f"`{ticket.get('Ticket ID', 'Unknown')}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="Ticket Type",
+        value=str(ticket.get("Ticket Type", "Unknown")),
+        inline=True,
+    )
+    embed.add_field(
+        name="Premium Event Allowance",
+        value=str(ticket.get("Premium Event Allowance", 0)),
+        inline=True,
+    )
+    embed.add_field(
+        name="Next Step",
+        value=(
+            "Run `/robincon-register` to choose your RobinCon T-shirt size. "
+            "Premium-event selection will follow in the next stage."
+        ),
+        inline=False,
+    )
+    return embed
+
+
+class RobinConTicketSelect(discord.ui.Select):
+    """Allow a purchaser to choose one unlinked ticket from a larger order."""
+
+    def __init__(
+        self,
+        *,
+        tickets: list[dict[str, Any]],
+        owner_id: int,
+        holder_name: str,
+        holder_email: str,
+    ) -> None:
+        self.owner_id = owner_id
+        self.holder_name = holder_name
+        self.holder_email = holder_email
+
+        options = [
+            discord.SelectOption(
+                label=(
+                    f"Ticket {ticket.get('Ticket Number', '?')} — "
+                    f"{ticket.get('Ticket Type', 'Ticket')}"
+                )[:100],
+                value=str(ticket.get("Ticket ID", "")),
+                description=f"Ticket ID: {ticket.get('Ticket ID', 'Unknown')}"[:100],
+            )
+            for ticket in tickets[:25]
+        ]
+
+        super().__init__(
+            placeholder="Choose the ticket you want to link",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Only the person who started this link can choose a ticket.",
+                ephemeral=True,
+            )
+            return
+
+        if robincon_service is None:
+            await interaction.response.send_message(
+                "❌ RobinCon is temporarily unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            ticket = await asyncio.to_thread(
+                robincon_service.link_ticket,
+                ticket_id=self.values[0],
+                discord_user_id=interaction.user.id,
+                discord_username=str(interaction.user),
+                holder_name=self.holder_name,
+                holder_email=self.holder_email,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("RobinCon multi-ticket link failed")
+            await interaction.followup.send(
+                "❌ The selected ticket could not be linked.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=build_robincon_linked_embed(ticket),
+            view=None,
+        )
+
+
+class RobinConTicketSelectView(discord.ui.View):
+    """Private selector view for an order containing multiple tickets."""
+
+    def __init__(
+        self,
+        *,
+        tickets: list[dict[str, Any]],
+        owner_id: int,
+        holder_name: str,
+        holder_email: str,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(
+            RobinConTicketSelect(
+                tickets=tickets,
+                owner_id=owner_id,
+                holder_name=holder_name,
+                holder_email=holder_email,
+            )
+        )
+
+
+class RobinConLinkModal(discord.ui.Modal, title="Link RobinCon Ticket"):
+    """Collect private order details used to verify ticket ownership."""
+
+    order_number = discord.ui.TextInput(
+        label="Order Number",
+        placeholder="Enter the order number from your confirmation email",
+        min_length=1,
+        max_length=100,
+    )
+    customer_email = discord.ui.TextInput(
+        label="Purchaser Email",
+        placeholder="Enter the email used for the purchase",
+        min_length=3,
+        max_length=254,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if robincon_service is None:
+            await interaction.response.send_message(
+                "❌ RobinCon is temporarily unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            order, tickets = await asyncio.to_thread(
+                robincon_service.prepare_ticket_link,
+                order_number=self.order_number.value,
+                customer_email=self.customer_email.value,
+                discord_user_id=interaction.user.id,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("RobinCon order verification failed")
+            await interaction.followup.send(
+                "❌ The RobinCon order could not be verified.",
+                ephemeral=True,
+            )
+            return
+
+        holder_name = str(order.get("Customer Name", "")).strip()
+        if not holder_name:
+            holder_name = interaction.user.display_name
+        holder_email = str(order.get("Customer Email", "")).strip()
+
+        if len(tickets) == 1:
+            try:
+                ticket = await asyncio.to_thread(
+                    robincon_service.link_ticket,
+                    ticket_id=str(tickets[0].get("Ticket ID", "")),
+                    discord_user_id=interaction.user.id,
+                    discord_username=str(interaction.user),
+                    holder_name=holder_name,
+                    holder_email=holder_email,
+                )
+            except ValueError as exc:
+                await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+                return
+            except Exception:
+                logger.exception("RobinCon ticket link failed")
+                await interaction.followup.send(
+                    "❌ Your RobinCon ticket could not be linked.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.followup.send(
+                embed=build_robincon_linked_embed(ticket),
+                ephemeral=True,
+            )
+            return
+
+        view = RobinConTicketSelectView(
+            tickets=tickets,
+            owner_id=interaction.user.id,
+            holder_name=holder_name,
+            holder_email=holder_email,
+        )
+        await interaction.followup.send(
+            (
+                f"✅ Order `{order.get('Order Number', 'Unknown')}` was verified.\n\n"
+                "This order contains multiple unlinked tickets. Choose the "
+                "ticket you want to link to your Discord account."
+            ),
+            view=view,
+            ephemeral=True,
+        )
+
+
+class RobinConTShirtSelect(discord.ui.Select):
+    """Allow a linked attendee to choose an enabled T-shirt size."""
+
+    def __init__(
+        self,
+        *,
+        sizes: list[dict[str, Any]],
+        owner_id: int,
+    ) -> None:
+        self.owner_id = owner_id
+        options = [
+            discord.SelectOption(
+                label=str(size.get("Display Name", size.get("Size ID", "Size")))[:100],
+                value=str(size.get("Size ID", "")),
+            )
+            for size in sizes[:25]
+        ]
+        super().__init__(
+            placeholder="Choose your RobinCon T-shirt size",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Only the attendee who opened this menu can use it.",
+                ephemeral=True,
+            )
+            return
+        if robincon_service is None:
+            await interaction.response.send_message(
+                "❌ RobinCon is temporarily unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            ticket = await asyncio.to_thread(
+                robincon_service.select_tshirt_size,
+                discord_user_id=interaction.user.id,
+                discord_username=str(interaction.user),
+                size_id=self.values[0],
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("RobinCon T-shirt selection failed")
+            await interaction.followup.send(
+                "❌ Your T-shirt size could not be saved.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="✅ RobinCon T-Shirt Size Saved",
+            description=(
+                f"Ticket `{ticket.get('Ticket ID', 'Unknown')}` has been "
+                "updated successfully."
+            ),
+        )
+        embed.add_field(
+            name="T-Shirt Size",
+            value=str(ticket.get("T-Shirt Size", "Unknown")),
+            inline=True,
+        )
+        embed.add_field(
+            name="Registration Status",
+            value="In progress — premium events still need to be selected.",
+            inline=False,
+        )
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=None,
+        )
+
+
+class RobinConTShirtView(discord.ui.View):
+    """Private T-shirt size selection view."""
+
+    def __init__(
+        self,
+        *,
+        sizes: list[dict[str, Any]],
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(
+            RobinConTShirtSelect(sizes=sizes, owner_id=owner_id)
+        )
+
+
+@bot.tree.command(
+    name="robincon-register",
+    description="Continue registration for your linked RobinCon ticket.",
+)
+async def robincon_register(interaction: discord.Interaction) -> None:
+    """Open the first RobinCon registration step: T-shirt selection."""
+
+    if robincon_service is None:
+        await interaction.response.send_message(
+            "❌ RobinCon is temporarily unavailable.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ticket = await asyncio.to_thread(
+            robincon_service.get_linked_ticket_with_row,
+            interaction.user.id,
+        )
+        if ticket is None:
+            raise ValueError(
+                "You must link a RobinCon ticket before registering."
+            )
+        if not await asyncio.to_thread(
+            robincon_service.is_tshirt_selection_open
+        ):
+            raise ValueError("RobinCon T-shirt selection is currently closed.")
+        sizes = await asyncio.to_thread(
+            robincon_service.get_enabled_tshirt_sizes
+        )
+        if not sizes:
+            raise ValueError("No RobinCon T-shirt sizes are currently available.")
+    except ValueError as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+        return
+    except Exception:
+        logger.exception("Unable to start RobinCon registration")
+        await interaction.followup.send(
+            "❌ RobinCon registration could not be started.",
+            ephemeral=True,
+        )
+        return
+
+    current_size = str(ticket.get("T-Shirt Size", "")).strip()
+    message = (
+        f"Ticket: `{ticket.get('Ticket ID', 'Unknown')}`\n\n"
+        "Choose the T-shirt size included with this ticket."
+    )
+    if current_size:
+        message += f"\n\nCurrent selection: **{current_size}**"
+
+    await interaction.followup.send(
+        message,
+        view=RobinConTShirtView(
+            sizes=sizes,
+            owner_id=interaction.user.id,
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="robincon-link",
+    description="Link a paid RobinCon ticket to your Discord account.",
+)
+async def robincon_link(interaction: discord.Interaction) -> None:
+    """Open the private RobinCon order-verification modal."""
+
+    if robincon_service is None:
+        await interaction.response.send_message(
+            "❌ RobinCon is temporarily unavailable.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(RobinConLinkModal())
+
+
 @bot.tree.command(
     name="robincon-status",
     description="Check the RobinCon service connection.",
@@ -2026,8 +2430,13 @@ async def robincon_status(
         inline=True,
     )
     embed.add_field(
-        name="Open Premium Events",
-        value=str(status["premium_event_count"]),
+        name="Saturday Premium Events",
+        value=str(status["saturday_event_count"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Sunday Premium Events",
+        value=str(status["sunday_event_count"]),
         inline=True,
     )
 
