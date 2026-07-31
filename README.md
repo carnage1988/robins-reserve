@@ -21,7 +21,7 @@ docker compose up -d --build
 
 # Current Status
 
-**Version:** v1.2.0
+**Version:** v1.3.1
 
 **Status:** Production
 
@@ -80,6 +80,23 @@ docker compose up -d --build
 
 ---
 
+## Operational health commands
+
+Staff can inspect the running service without searching container logs:
+
+```text
+/health
+/cache-status
+/cache-clear
+```
+
+`/health` reports service availability, League task state, Google Sheets request/retry counts and cache effectiveness. `/cache-clear` is administrator-only and should be used after urgent manual workbook changes when waiting for the normal cache expiry is undesirable.
+
+## Google Sheets resilience
+
+All gspread HTTP requests use bounded retry with exponential backoff for HTTP 429 and transient 5xx failures. Frequently repeated worksheet reads are cached briefly and invalidated immediately after writes. League role reconciliation uses one player read and one batched state write per cycle.
+
+
 # Architecture
 
 ```
@@ -122,10 +139,14 @@ docker compose up -d --build
 ```
 discord-preorder-bot/
 │
-├── bot.py
+├── bot.py                 # Thin application entry point
 ├── config.py
-├── sheets_service.py      # Google Sheets + OrderManager
-├── league_service.py      # League events, attendance and role state
+├── app/                   # Runtime and dependency wiring
+├── cogs/                  # Discord command/event modules
+├── views/                 # Discord UI workflows
+├── tasks/                 # Background task modules
+├── services/              # Sheets, League and RobinCon services
+├── utils/                 # Logging and shared helpers
 ├── Dockerfile
 ├── compose.yaml
 ├── requirements.txt

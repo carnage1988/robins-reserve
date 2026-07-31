@@ -5,7 +5,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config import LEAGUE_EVENT_DURATION_HOURS, LEAGUE_WINDOW_DAYS
-from sheets_service import SheetsService
+from services.sheets_service import SheetsService
 
 
 BELFAST_TZ = ZoneInfo("Europe/London")
@@ -348,7 +348,10 @@ class LeagueService:
         cutoff = self._now() - timedelta(days=LEAGUE_WINDOW_DAYS)
         results: list[dict[str, Any]] = []
 
-        for record in self.sheets.league_players_sheet.get_all_records():
+        for row_number, record in enumerate(
+            self.sheets.league_players_sheet.get_all_records(),
+            start=2,
+        ):
             user_id = str(record.get("Discord User ID", "")).strip()
             if not user_id.isdigit():
                 continue
@@ -363,6 +366,7 @@ class LeagueService:
 
             results.append(
                 {
+                    "row_number": row_number,
                     "discord_user_id": int(user_id),
                     "player_id": str(record.get("Player ID", "")).strip(),
                     "last_attendance": last_attendance,
@@ -395,3 +399,25 @@ class LeagueService:
             5,
             "TRUE" if active else "FALSE",
         )
+
+    def set_role_states_bulk(
+        self,
+        updates: list[tuple[int, bool]],
+    ) -> int:
+        """Persist multiple role-state changes in one Sheets request."""
+
+        if not updates:
+            return 0
+
+        payload = [
+            {
+                "range": f"E{row_number}",
+                "values": [["TRUE" if active else "FALSE"]],
+            }
+            for row_number, active in updates
+            if row_number >= 2
+        ]
+        if not payload:
+            return 0
+        self.sheets.league_players_sheet.batch_update(payload)
+        return len(payload)

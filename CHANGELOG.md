@@ -1,3 +1,15 @@
+# v1.3.1 - 31/07/2026
+
+## Added
+- Modular cogs, views, services and runtime structure
+- Central Google Sheets retry, backoff, caching and cache invalidation layer
+- RobinCon staff ticket lookup, search, attendee, T-shirt, capacity and manual check-in commands
+
+## Changed
+- Reduced bot.py to application startup and command synchronisation
+- Isolated preorder, League and RobinCon customer workflows into dedicated modules
+- Hardened League role reconciliation so one Sheets or Discord error does not terminate the loop
+
 # v1.2.0 - 27/07/2026
 
 ## Added

@@ -167,6 +167,11 @@ class RobinConService:
                 "QR Code",
                 "Ticket Status",
                 "Registration Complete",
+                "Saturday Event ID",
+                "Saturday Event Name",
+                "Sunday Event ID",
+                "Sunday Event Name",
+                "Registration Completed At",
             ],
         )
 
@@ -687,6 +692,205 @@ class RobinConService:
             order_number=str(ticket.get("Order Number", "")),
             result="Success",
             details=f"T-shirt size selected: {display_name}.",
+            source="Discord",
+        )
+        return ticket
+
+    def is_premium_event_registration_open(self) -> bool:
+        """Return whether customers may currently register for premium events."""
+
+        configuration = self.get_configuration()
+        return self._is_true(
+            configuration.get("Premium Event Registration Open", "FALSE")
+        )
+
+    def _get_event_by_id(self, event_id: str, day: str) -> dict[str, Any]:
+        """Return one active event from the requested day."""
+
+        wanted = str(event_id or "").strip().casefold()
+        events = (
+            self.get_active_saturday_events()
+            if day == "Saturday"
+            else self.get_active_sunday_events()
+        )
+        for event in events:
+            if str(event.get("Event ID", "")).strip().casefold() == wanted:
+                return event
+        raise ValueError(f"That {day} premium event is not currently available.")
+
+    def _event_registration_count(self, event_id: str) -> int:
+        """Count active registrations for an event."""
+
+        wanted = str(event_id or "").strip().casefold()
+        return sum(
+            1
+            for record in self.event_registrations_sheet.get_all_records()
+            if str(record.get("Event ID", "")).strip().casefold() == wanted
+            and str(record.get("Registration Status", "")).strip().casefold()
+            not in {"cancelled", "canceled", "refunded"}
+        )
+
+    def _next_registration_id(self) -> int:
+        highest = 0
+        for record in self.event_registrations_sheet.get_all_records():
+            registration_id = str(record.get("Registration ID", "")).strip()
+            match = re.search(r"(\d+)$", registration_id)
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return highest + 1
+
+    def complete_registration(
+        self,
+        *,
+        discord_user_id: int,
+        discord_username: str,
+        tshirt_size_id: str,
+        saturday_event_id: str,
+        sunday_event_id: str,
+    ) -> dict[str, Any]:
+        """Save and permanently lock a complete RobinCon registration."""
+
+        if not self.is_tshirt_selection_open():
+            raise ValueError("RobinCon T-shirt selection is currently closed.")
+        if not self.is_premium_event_registration_open():
+            raise ValueError("RobinCon premium-event registration is currently closed.")
+
+        ticket = self.get_linked_ticket_with_row(discord_user_id)
+        if ticket is None:
+            raise ValueError("You must link a RobinCon ticket before registering.")
+        if self._is_true(ticket.get("Registration Complete", "")):
+            raise ValueError("Your RobinCon registration is already complete and locked.")
+
+        wanted_size = str(tshirt_size_id or "").strip().casefold()
+        selected_size = None
+        for size in self.get_enabled_tshirt_sizes():
+            code = str(size.get("Size ID", "")).strip().casefold()
+            display = str(size.get("Display Name", "")).strip().casefold()
+            if wanted_size in {code, display}:
+                selected_size = size
+                break
+        if selected_size is None:
+            raise ValueError("That T-shirt size is not currently available.")
+
+        saturday_event = self._get_event_by_id(saturday_event_id, "Saturday")
+        sunday_event = self._get_event_by_id(sunday_event_id, "Sunday")
+
+        existing_regs = [
+            record
+            for record in self.event_registrations_sheet.get_all_records()
+            if str(record.get("Ticket ID", "")).strip()
+            == str(ticket.get("Ticket ID", "")).strip()
+            and str(record.get("Registration Status", "")).strip().casefold()
+            not in {"cancelled", "canceled", "refunded"}
+        ]
+        if existing_regs:
+            raise ValueError(
+                "This ticket already has premium-event registrations. Please contact staff."
+            )
+
+        for event in (saturday_event, sunday_event):
+            try:
+                capacity = int(event.get("Capacity", 0) or 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Capacity is invalid for {event.get('Event Name', 'an event')}."
+                ) from exc
+            if capacity < 1:
+                raise ValueError(
+                    f"{event.get('Event Name', 'That event')} has no available capacity."
+                )
+            if self._event_registration_count(str(event.get("Event ID", ""))) >= capacity:
+                raise ValueError(
+                    f"{event.get('Event Name', 'That event')} is now fully booked."
+                )
+
+        registration_headers = self.event_registrations_sheet.row_values(1)
+        start_row_count = self.event_registrations_sheet.row_count
+        sequence = self._next_registration_id()
+        now = self._now()
+        appended = 0
+        try:
+            for event in (saturday_event, sunday_event):
+                event_id = str(event.get("Event ID", "")).strip()
+                registration_number = self._event_registration_count(event_id) + 1
+                record = {
+                    "Registration ID": f"REG-{sequence:06d}",
+                    "Ticket ID": str(ticket.get("Ticket ID", "")),
+                    "Order Number": str(ticket.get("Order Number", "")),
+                    "Event ID": event_id,
+                    "Event Name": str(event.get("Event Name", "")).strip(),
+                    "Registration Number": registration_number,
+                    "Registration Timestamp": now,
+                    "Registration Status": "Confirmed",
+                    "Registered By": "Customer",
+                    "Registered Discord ID": str(discord_user_id),
+                }
+                self.event_registrations_sheet.append_row(
+                    [record.get(header, "") for header in registration_headers],
+                    value_input_option="USER_ENTERED",
+                )
+                appended += 1
+                sequence += 1
+
+            headers = self.tickets_sheet.row_values(1)
+            columns = {header: headers.index(header) + 1 for header in (
+                "T-Shirt Size",
+                "Saturday Event ID",
+                "Saturday Event Name",
+                "Sunday Event ID",
+                "Sunday Event Name",
+                "Registration Complete",
+                "Registration Completed At",
+            )}
+            row_number = int(ticket["row_number"])
+            updates = {
+                "T-Shirt Size": str(selected_size.get("Display Name", selected_size.get("Size ID", ""))).strip(),
+                "Saturday Event ID": str(saturday_event.get("Event ID", "")).strip(),
+                "Saturday Event Name": str(saturday_event.get("Event Name", "")).strip(),
+                "Sunday Event ID": str(sunday_event.get("Event ID", "")).strip(),
+                "Sunday Event Name": str(sunday_event.get("Event Name", "")).strip(),
+                "Registration Complete": "TRUE",
+                "Registration Completed At": now,
+            }
+            for header, value in updates.items():
+                self.tickets_sheet.update_cell(row_number, columns[header], value)
+        except Exception:
+            if appended:
+                current_rows = len(self.event_registrations_sheet.get_all_values())
+                first_appended = current_rows - appended + 1
+                self.event_registrations_sheet.delete_rows(first_appended, current_rows)
+            raise
+
+        ticket.update(updates)
+        for action, event in (
+            ("Saturday Event Selected", saturday_event),
+            ("Sunday Event Selected", sunday_event),
+        ):
+            self.write_audit_log(
+                action=action,
+                action_category="Customer",
+                discord_user_id=discord_user_id,
+                discord_username=discord_username,
+                ticket_id=str(ticket.get("Ticket ID", "")),
+                order_number=str(ticket.get("Order Number", "")),
+                event_id=str(event.get("Event ID", "")),
+                result="Success",
+                details=f"Premium event selected: {event.get('Event Name', '')}.",
+                source="Discord",
+            )
+        self.write_audit_log(
+            action="Registration Completed",
+            action_category="Customer",
+            discord_user_id=discord_user_id,
+            discord_username=discord_username,
+            ticket_id=str(ticket.get("Ticket ID", "")),
+            order_number=str(ticket.get("Order Number", "")),
+            result="Success",
+            details=(
+                f"Registration locked with T-shirt {updates['T-Shirt Size']}, "
+                f"Saturday {updates['Saturday Event Name']}, and "
+                f"Sunday {updates['Sunday Event Name']}."
+            ),
             source="Discord",
         )
         return ticket
