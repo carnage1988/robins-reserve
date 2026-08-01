@@ -67,6 +67,25 @@ docker compose up -d --build
   - Cancelled orders
   - Rejected orders
 
+## RobinCon Staff Operations
+
+Staff commands require the configured `STAFF_ROLE_ID` and must be run inside the Discord server.
+
+```text
+/robincon-ticket <ticket ID>
+/robincon-find <query>
+/robincon-order <order number>
+/robincon-summary
+/robincon-tshirts
+/robincon-capacity
+/robincon-attendees <Saturday|Sunday>
+/robincon-checkin <ticket ID>
+/robincon-uncheckin <ticket ID>
+/robincon-edit <ticket ID> <field> <value>
+```
+
+Staff edits support attendee names, enabled T-shirt sizes, and active Saturday or Sunday premium events. Event changes enforce capacity and update both the Tickets and Event Registrations worksheets. Every write is recorded in the RobinCon Audit Log.
+
 ## Backend
 
 - Google Sheets integration

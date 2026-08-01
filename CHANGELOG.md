@@ -1,3 +1,29 @@
+# v1.3.2 - RobinCon Staff Administration Phase 2
+
+## Added
+
+- `/robincon-order` family and group order lookup
+- `/robincon-summary` operational totals
+- `/robincon-uncheckin` to reverse accidental check-ins
+- `/robincon-edit` for attendee, T-shirt and premium-event corrections
+- Capacity validation for staff event changes
+- Audit logging for staff edits and reversed check-ins
+- Staff Phase 2 test plan
+
+## Changed
+
+- RobinCon staff commands now use non-blocking worker threads for Google Sheets operations
+- Ticket lookup displays friendly registration and check-in states
+- Existing staff commands have clearer error handling and output formatting
+
+# Unreleased
+
+## Changed
+
+- A single Discord account can now manage and register multiple RobinCon tickets from family or group orders.
+- Ticket linking records the attendee name separately from the purchaser email.
+- `/robincon-register` now asks which attendee ticket to manage when more than one ticket is linked.
+
 # v1.3.1 - 31/07/2026
 
 ## Added

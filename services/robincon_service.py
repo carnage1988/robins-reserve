@@ -609,13 +609,14 @@ class RobinConService:
             configuration.get("T-Shirt Selection Open", "FALSE")
         )
 
-    def get_linked_ticket_with_row(
+    def get_linked_tickets_with_rows(
         self,
         discord_user_id: int,
-    ) -> dict[str, Any] | None:
-        """Return a linked active ticket with its worksheet row number."""
+    ) -> list[dict[str, Any]]:
+        """Return all active tickets managed by a Discord account."""
 
         wanted_id = str(discord_user_id)
+        tickets: list[dict[str, Any]] = []
         for row_number, record in enumerate(
             self.tickets_sheet.get_all_records(),
             start=2,
@@ -632,8 +633,31 @@ class RobinConService:
                 continue
             ticket = dict(record)
             ticket["row_number"] = row_number
-            return ticket
-        return None
+            tickets.append(ticket)
+
+        return sorted(
+            tickets,
+            key=lambda item: (
+                self._normalise_order_number(item.get("Order Number", "")),
+                int(item.get("Ticket Number", 0) or 0),
+            ),
+        )
+
+    def get_linked_ticket_with_row(
+        self,
+        discord_user_id: int,
+        ticket_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Return one active managed ticket, optionally selected by ticket ID."""
+
+        tickets = self.get_linked_tickets_with_rows(discord_user_id)
+        wanted_ticket = str(ticket_id or "").strip().casefold()
+        if wanted_ticket:
+            for ticket in tickets:
+                if str(ticket.get("Ticket ID", "")).strip().casefold() == wanted_ticket:
+                    return ticket
+            return None
+        return tickets[0] if tickets else None
 
     def select_tshirt_size(
         self,
@@ -747,6 +771,7 @@ class RobinConService:
         tshirt_size_id: str,
         saturday_event_id: str,
         sunday_event_id: str,
+        ticket_id: str = "",
     ) -> dict[str, Any]:
         """Save and permanently lock a complete RobinCon registration."""
 
@@ -755,9 +780,11 @@ class RobinConService:
         if not self.is_premium_event_registration_open():
             raise ValueError("RobinCon premium-event registration is currently closed.")
 
-        ticket = self.get_linked_ticket_with_row(discord_user_id)
+        ticket = self.get_linked_ticket_with_row(discord_user_id, ticket_id)
         if ticket is None:
-            raise ValueError("You must link a RobinCon ticket before registering.")
+            raise ValueError(
+                "That ticket is not linked to your Discord account or is not active."
+            )
         if self._is_true(ticket.get("Registration Complete", "")):
             raise ValueError("Your RobinCon registration is already complete and locked.")
 
@@ -899,22 +926,10 @@ class RobinConService:
         self,
         discord_user_id: int,
     ) -> dict[str, Any] | None:
-        """Return the active ticket linked to a Discord account, if any."""
+        """Return the first active ticket managed by a Discord account."""
 
-        wanted_id = str(discord_user_id)
-        for record in self.tickets_sheet.get_all_records():
-            if str(record.get("Discord User ID", "")).strip() != wanted_id:
-                continue
-            if not self._is_true(record.get("Linked", "")):
-                continue
-            if str(record.get("Ticket Status", "")).strip().casefold() in {
-                "cancelled",
-                "canceled",
-                "refunded",
-            }:
-                continue
-            return record
-        return None
+        tickets = self.get_linked_tickets_with_rows(discord_user_id)
+        return tickets[0] if tickets else None
 
     def get_available_tickets_for_order(
         self,
@@ -963,13 +978,6 @@ class RobinConService:
         if not self.is_ticket_linking_open():
             raise ValueError("RobinCon ticket linking is currently closed.")
 
-        linked_ticket = self.get_linked_ticket_for_user(discord_user_id)
-        if linked_ticket is not None:
-            raise ValueError(
-                "Your Discord account is already linked to ticket "
-                f"{linked_ticket.get('Ticket ID', 'Unknown')}."
-            )
-
         order = self.find_order(order_number, customer_email)
         if order is None:
             raise ValueError(
@@ -998,11 +1006,6 @@ class RobinConService:
         holder_email: str,
     ) -> dict[str, Any]:
         """Link one unclaimed ticket to a Discord account."""
-
-        if self.get_linked_ticket_for_user(discord_user_id) is not None:
-            raise ValueError(
-                "Your Discord account is already linked to a RobinCon ticket."
-            )
 
         headers = self.tickets_sheet.row_values(1)
         try:
@@ -1071,7 +1074,10 @@ class RobinConService:
             ticket_id=str(result.get("Ticket ID", "")),
             order_number=str(result.get("Order Number", "")),
             result="Success",
-            details="Discord account linked to RobinCon ticket.",
+            details=(
+                "Discord account assigned as ticket manager for attendee "
+                f"{updates['Ticket Holder Name'] or 'Unknown'}."
+            ),
             source="Discord",
         )
         return result

@@ -13,7 +13,7 @@ def build_robincon_linked_embed(ticket: dict[str, Any]) -> discord.Embed:
     embed = discord.Embed(
         title="✅ RobinCon Ticket Linked",
         description=(
-            "Your Discord account is now linked to this RobinCon ticket."
+            "Your Discord account now manages this RobinCon ticket."
         ),
     )
     embed.add_field(
@@ -27,6 +27,11 @@ def build_robincon_linked_embed(ticket: dict[str, Any]) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
+        name="Attendee",
+        value=str(ticket.get("Ticket Holder Name", "Unknown")) or "Unknown",
+        inline=True,
+    )
+    embed.add_field(
         name="Premium Event Allowance",
         value=str(ticket.get("Premium Event Allowance", 0)),
         inline=True,
@@ -34,8 +39,8 @@ def build_robincon_linked_embed(ticket: dict[str, Any]) -> discord.Embed:
     embed.add_field(
         name="Next Step",
         value=(
-            "Run `/robincon-register` to choose your RobinCon T-shirt size. "
-            "Premium-event selection will follow in the next stage."
+            "Run `/robincon-register` to choose the attendee and complete "
+            "their T-shirt and premium-event registration."
         ),
         inline=False,
     )
@@ -157,6 +162,12 @@ class RobinConLinkModal(discord.ui.Modal, title="Link RobinCon Ticket"):
         min_length=3,
         max_length=254,
     )
+    attendee_name = discord.ui.TextInput(
+        label="Attendee Name",
+        placeholder="Who will use this ticket?",
+        min_length=1,
+        max_length=100,
+    )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if robincon_service is None:
@@ -186,9 +197,7 @@ class RobinConLinkModal(discord.ui.Modal, title="Link RobinCon Ticket"):
             )
             return
 
-        holder_name = str(order.get("Customer Name", "")).strip()
-        if not holder_name:
-            holder_name = interaction.user.display_name
+        holder_name = self.attendee_name.value.strip()
         holder_email = str(order.get("Customer Email", "")).strip()
 
         if len(tickets) == 1:
@@ -228,7 +237,7 @@ class RobinConLinkModal(discord.ui.Modal, title="Link RobinCon Ticket"):
             (
                 f"✅ Order `{order.get('Order Number', 'Unknown')}` was verified.\n\n"
                 "This order contains multiple unlinked tickets. Choose the "
-                "ticket you want to link to your Discord account."
+                "ticket you want this Discord account to manage."
             ),
             view=view,
             ephemeral=True,
@@ -246,6 +255,11 @@ def build_robincon_registration_complete_embed(
             f"Ticket `{ticket.get('Ticket ID', 'Unknown')}` is fully "
             "registered and the selections are now locked."
         ),
+    )
+    embed.add_field(
+        name="Attendee",
+        value=str(ticket.get("Ticket Holder Name", "Unknown")) or "Unknown",
+        inline=False,
     )
     embed.add_field(
         name="T-Shirt",
@@ -275,6 +289,162 @@ def build_robincon_registration_complete_embed(
         text="Contact Robin's staff if a correction is required."
     )
     return embed
+
+
+async def start_robincon_registration(
+    interaction: discord.Interaction,
+    ticket: dict[str, Any],
+    *,
+    edit_original: bool,
+) -> None:
+    """Start or display registration for one explicitly selected ticket."""
+
+    if robincon_service is None:
+        message = "❌ RobinCon is temporarily unavailable."
+        if edit_original:
+            await interaction.response.edit_message(content=message, embed=None, view=None)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+        return
+
+    if str(ticket.get("Registration Complete", "")).strip().upper() == "TRUE":
+        embed = build_robincon_registration_complete_embed(ticket)
+        if edit_original:
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    try:
+        tshirt_open, events_open, sizes, saturday_events, sunday_events = (
+            await asyncio.gather(
+                asyncio.to_thread(robincon_service.is_tshirt_selection_open),
+                asyncio.to_thread(robincon_service.is_premium_event_registration_open),
+                asyncio.to_thread(robincon_service.get_enabled_tshirt_sizes),
+                asyncio.to_thread(robincon_service.get_active_saturday_events),
+                asyncio.to_thread(robincon_service.get_active_sunday_events),
+            )
+        )
+        if not tshirt_open:
+            raise ValueError("RobinCon T-shirt selection is currently closed.")
+        if not events_open:
+            raise ValueError("RobinCon premium-event registration is currently closed.")
+        if not sizes:
+            raise ValueError("No RobinCon T-shirt sizes are currently available.")
+        if not saturday_events:
+            raise ValueError("No Saturday premium events are currently available.")
+        if not sunday_events:
+            raise ValueError("No Sunday premium events are currently available.")
+        if len(sizes) > 25 or len(saturday_events) > 25 or len(sunday_events) > 25:
+            raise ValueError(
+                "A registration list contains more than Discord's 25-option limit."
+            )
+    except ValueError as exc:
+        message = f"❌ {exc}"
+        if edit_original:
+            await interaction.response.edit_message(content=message, embed=None, view=None)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+        return
+    except Exception:
+        logger.exception("Unable to start RobinCon registration")
+        message = "❌ RobinCon registration could not be started."
+        if edit_original:
+            await interaction.response.edit_message(content=message, embed=None, view=None)
+        else:
+            await interaction.followup.send(message, ephemeral=True)
+        return
+
+    state = RobinConRegistrationState(
+        owner_id=interaction.user.id,
+        ticket=ticket,
+        sizes=sizes,
+        saturday_events=saturday_events,
+        sunday_events=sunday_events,
+    )
+    attendee = str(ticket.get("Ticket Holder Name", "")).strip() or "Attendee"
+    current_size = str(ticket.get("T-Shirt Size", "")).strip()
+    message = (
+        "**RobinCon Registration — Step 1 of 4**\n\n"
+        f"✅ Attendee: **{attendee}**\n"
+        f"✅ Ticket: `{ticket.get('Ticket ID', 'Unknown')}`\n\n"
+        "Choose the T-shirt size included with this ticket."
+    )
+    if current_size:
+        message += f"\n\nCurrent saved size: **{current_size}**"
+    registration_view = RobinConTShirtStepView(state)
+    if edit_original:
+        await interaction.response.edit_message(
+            content=message,
+            embed=None,
+            view=registration_view,
+        )
+    else:
+        await interaction.followup.send(
+            message,
+            view=registration_view,
+            ephemeral=True,
+        )
+
+
+class RobinConManagedTicketSelect(discord.ui.Select):
+    """Choose one attendee ticket managed by a shared Discord account."""
+
+    def __init__(self, *, tickets: list[dict[str, Any]], owner_id: int) -> None:
+        self.tickets = tickets
+        self.owner_id = owner_id
+        options = []
+        for ticket in tickets[:25]:
+            attendee = str(ticket.get("Ticket Holder Name", "")).strip() or "Unnamed attendee"
+            complete = str(ticket.get("Registration Complete", "")).strip().upper() == "TRUE"
+            options.append(
+                discord.SelectOption(
+                    label=attendee[:100],
+                    value=str(ticket.get("Ticket ID", "")),
+                    description=(
+                        f"{ticket.get('Ticket ID', 'Unknown')} — "
+                        f"{'Registered' if complete else 'Registration required'}"
+                    )[:100],
+                    emoji="✅" if complete else "🎟️",
+                )
+            )
+        super().__init__(
+            placeholder="Choose the attendee ticket to register",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Only the person managing these tickets can use this selector.",
+                ephemeral=True,
+            )
+            return
+        ticket = next(
+            (
+                item
+                for item in self.tickets
+                if str(item.get("Ticket ID", "")) == self.values[0]
+            ),
+            None,
+        )
+        if ticket is None:
+            await interaction.response.send_message(
+                "❌ That ticket could not be found.",
+                ephemeral=True,
+            )
+            return
+        await start_robincon_registration(interaction, ticket, edit_original=True)
+
+
+class RobinConManagedTicketSelectView(discord.ui.View):
+    def __init__(self, *, tickets: list[dict[str, Any]], owner_id: int) -> None:
+        super().__init__(timeout=600)
+        self.add_item(
+            RobinConManagedTicketSelect(tickets=tickets, owner_id=owner_id)
+        )
 
 
 class RobinConRegistrationState:
@@ -549,6 +719,7 @@ class RobinConRegistrationConfirmView(discord.ui.View):
                 tshirt_size_id=self.state.tshirt_size_id,
                 saturday_event_id=self.state.saturday_event_id,
                 sunday_event_id=self.state.sunday_event_id,
+                ticket_id=str(self.state.ticket.get("Ticket ID", "")),
             )
         except ValueError as exc:
             button.disabled = False
