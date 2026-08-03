@@ -3,33 +3,56 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-
-    image: robins-reserve:1.3.1-dev
+    image: robins-reserve:1.4.0-dev
     container_name: robins-reserve-robincon-dev
-
     restart: unless-stopped
-
-    env_file:
-      - .env
-
+    env_file: [.env]
     volumes:
       - robincon_data:/app/data
       - robincon_logs:/app/logs
-      - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,Z
-
+      - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('/app/logs/robins_reserve.log').exists() else 1)\""
-        ]
+      test: ["CMD-SHELL", "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('/app/logs/robins_reserve.log').exists() else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+    security_opt: ["no-new-privileges:true"]
 
-    security_opt:
-      - no-new-privileges:true
+  robins-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robins-reserve:1.4.0-dev
+    container_name: robins-reserve-api-dev
+    command: ["uvicorn", "dashboard_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - robincon_data:/app/data
+      - robincon_logs:/app/logs
+      - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    security_opt: ["no-new-privileges:true"]
+
+  robins-dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: robins-reserve-dashboard:1.4.0-dev
+    container_name: robins-reserve-dashboard-dev
+    restart: unless-stopped
+    depends_on:
+      robins-api:
+        condition: service_healthy
+    ports:
+      - "10000:80"
+    security_opt: ["no-new-privileges:true"]
 
 volumes:
   robincon_data:

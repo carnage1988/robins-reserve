@@ -101,3 +101,27 @@
 - Lookup command
 - Google Sheets archive
 - Production deployment
+
+# v1.4.0 - Dashboard Operations Pass
+
+## Added
+
+- Fixed red-accented Operations Portal layout with sectioned, collapsible navigation
+- Dashboard service-health lights with green online and red offline states
+- Pending approval cards with itemised pricing and basket totals
+- Dashboard-driven approval and decline actions integrated with Discord reactions and customer DMs
+- Pickup-PIN order lookup with collection controls and automatic 60-second idle reset
+- Live Pokémon League card and page with running state, store code, attendance and event times
+- Orders-today, collections-today, pending-order and League-attendance metrics
+- Recent preorder activity feed
+- Itemised pricing and basket totals in Discord approval messages
+
+## Changed
+
+- Preorder and archive sheets now require `Unit Price` and `Subtotal` columns
+- Dashboard approvals use the original Discord approval-message ID and normal reservation lifecycle
+- Completed dashboard decisions are removed from the shared pending-request persistence file
+
+## Preserved
+
+- Existing RobinCon family/group ticket registration support

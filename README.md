@@ -346,3 +346,8 @@ GitHub: https://github.com/carnage1988
 # Acknowledgements
 
 Robin's Reserve was developed as a real-world automation project to demonstrate practical software engineering, Docker deployment and DevOps practices while solving a genuine business workflow for an independent hobby store.
+
+
+## Hosted dashboard deployment
+
+See `DEPLOY-SPRINT-1-2.md` for the separated IONOS frontend and Marble API deployment.

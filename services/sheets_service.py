@@ -184,6 +184,8 @@ class SheetsService:
         "Approved By",
         "Approval Message ID",
         "Pickup PIN",
+        "Unit Price",
+        "Subtotal",
     ]
     COLLECTED_HEADERS = BASE_ORDER_HEADERS + ["Collected At", "Collected By"]
     CANCELLED_HEADERS = BASE_ORDER_HEADERS + [
@@ -316,6 +318,18 @@ class SheetsService:
     def _key_for_header(header: str) -> str:
         return header.strip().lower().replace(" ", "_")
 
+    @staticmethod
+    def _money_value(value: Any) -> float | None:
+        """Return a currency-like value as a float, or None when unavailable."""
+
+        text = str(value or "").strip().replace("£", "").replace(",", "")
+        if not text:
+            return None
+        try:
+            return round(float(text), 2)
+        except (TypeError, ValueError):
+            return None
+
     def get_products(self, open_only: bool = False) -> list[dict[str, Any]]:
         """Return valid products from the Products tab."""
 
@@ -381,6 +395,9 @@ class SheetsService:
                 "customer_limit": customer_limit,
                 "preorders_open": preorders_open,
                 "league_only": league_only,
+                "unit_price": self._money_value(
+                    record.get("Unit Price", record.get("Price", ""))
+                ),
             }
 
             if open_only and not preorders_open:
@@ -458,6 +475,10 @@ class SheetsService:
                 record.get("Approval Message ID", "")
             ).strip(),
             "pickup_pin": str(record.get("Pickup PIN", "")).strip(),
+            "unit_price": SheetsService._money_value(
+                record.get("Unit Price", record.get("Price", ""))
+            ),
+            "subtotal": SheetsService._money_value(record.get("Subtotal", "")),
             "collected_at": str(
                 record.get("Collected At", "")
             ).strip(),
@@ -545,6 +566,11 @@ class SheetsService:
             "sheet_name": first["sheet_name"],
             "items": items,
             "total_quantity": sum(item["quantity"] for item in items),
+            "total_value": (
+                round(sum(float(item["subtotal"]) for item in items), 2)
+                if items and all(item.get("subtotal") is not None for item in items)
+                else None
+            ),
         }
 
     def get_pending_reservation_for_customer(
@@ -861,22 +887,32 @@ class SheetsService:
         try:
             self._apply_stock_updates(stock_updates)
 
+            headers = self.preorders_sheet.row_values(1)
             for item in normalized_items:
+                unit_price = item.get("unit_price")
+                subtotal = (
+                    round(float(unit_price) * int(item["quantity"]), 2)
+                    if unit_price is not None
+                    else ""
+                )
+                record = {
+                    "Timestamp": timestamp,
+                    "Discord Username": discord_username,
+                    "Discord User ID": str(discord_user_id),
+                    "Product ID": item["product_id"],
+                    "Product Name": item["product_name"],
+                    "Quantity": item["quantity"],
+                    "Status": "Pending",
+                    "Approved By": "",
+                    "Approval Message ID": recorded_message_id,
+                    "Pickup PIN": pickup_pin,
+                    "Unit Price": unit_price if unit_price is not None else "",
+                    "Subtotal": subtotal,
+                    "Collected At": "",
+                    "Collected By": "",
+                }
                 self.preorders_sheet.append_row(
-                    [
-                        timestamp,
-                        discord_username,
-                        str(discord_user_id),
-                        item["product_id"],
-                        item["product_name"],
-                        item["quantity"],
-                        "Pending",
-                        "",
-                        recorded_message_id,
-                        pickup_pin,
-                        "",
-                        "",
-                    ],
+                    [record.get(header, "") for header in headers],
                     value_input_option="USER_ENTERED",
                 )
                 appended_rows += 1
@@ -899,6 +935,11 @@ class SheetsService:
                     **item,
                     "stock": update["new_stock"],
                     "status": "Pending",
+                    "subtotal": (
+                        round(float(item["unit_price"]) * int(item["quantity"]), 2)
+                        if item.get("unit_price") is not None
+                        else None
+                    ),
                 }
             )
 
@@ -908,6 +949,11 @@ class SheetsService:
             "items": reserved_items,
             "total_quantity": sum(
                 item["quantity"] for item in reserved_items
+            ),
+            "total_value": (
+                round(sum(float(item["subtotal"]) for item in reserved_items), 2)
+                if reserved_items and all(item.get("subtotal") is not None for item in reserved_items)
+                else None
             ),
         }
 

@@ -23,13 +23,35 @@ def format_datetime(timestamp: str) -> str:
     ).strftime("%d %b %Y at %H:%M")
 
 
-def format_items(items: list[dict[str, Any]]) -> str:
-    """Format order items for Discord messages."""
+def format_currency(value: Any) -> str:
+    try:
+        return f"£{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "Price unavailable"
 
-    return "\n".join(
-        f"• **{item['quantity']} × {item['product_name']}**"
-        for item in items
-    )
+
+def format_items(items: list[dict[str, Any]]) -> str:
+    """Format order items with pricing when it is available."""
+
+    lines: list[str] = []
+    for item in items:
+        quantity = int(item.get("quantity", 0) or 0)
+        name = str(item.get("product_name", "Unknown product"))
+        unit_price = item.get("unit_price")
+        subtotal = item.get("subtotal")
+        if unit_price is None or subtotal is None:
+            lines.append(f"• **{quantity} × {name}** — Price unavailable")
+        else:
+            lines.append(
+                f"• **{quantity} × {name}** — "
+                f"{format_currency(unit_price)} each — **{format_currency(subtotal)}**"
+            )
+    return "\n".join(lines)
+
+
+def format_basket_total(order: dict[str, Any]) -> str:
+    total = order.get("total_value")
+    return format_currency(total) if total is not None else "Price unavailable"
 
 
 def basket_quantity_for_product(
@@ -249,6 +271,11 @@ async def submit_basket(message: discord.Message) -> None:
     request_embed.add_field(
         name="Total Items",
         value=str(reserved_order["total_quantity"]),
+        inline=True,
+    )
+    request_embed.add_field(
+        name="Basket Total",
+        value=format_basket_total(reserved_order),
         inline=True,
     )
     request_embed.add_field(
@@ -697,6 +724,7 @@ async def on_raw_reaction_add(
             await customer.send(
                 "✅ **Robin's Reserve Preorder Approved**\n\n"
                 f"{format_items(processed_order['items'])}\n\n"
+                f"💷 Basket Total: **{format_basket_total(processed_order)}**\n\n"
                 f"🔐 Pickup PIN: "
                 f"**{processed_order['pickup_pin']}**\n\n"
                 "Please show this PIN when collecting the order."
@@ -733,6 +761,11 @@ async def on_raw_reaction_add(
                     value=str(
                         processed_order["total_quantity"]
                     ),
+                    inline=True,
+                )
+                approved_embed.add_field(
+                    name="Basket Total",
+                    value=format_basket_total(processed_order),
                     inline=True,
                 )
                 approved_embed.add_field(
