@@ -18,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from services.robincon_service import RobinConService
 from services.squarespace_service import SquarespaceService
-from services.internal_events import notify_internal_event
 
 
 logging.basicConfig(
@@ -344,9 +343,6 @@ def import_orders(
                 order_number,
                 len(tickets),
             )
-
-    if imported_count > 0 and not dry_run:
-        notify_internal_event("squarespace.imported")
 
     logger.info(
         "Squarespace scan complete: %s API order(s), "
