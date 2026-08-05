@@ -13,6 +13,36 @@ services:
       - ../../secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
     security_opt: ["no-new-privileges:true"]
 
+  squarespace-import-dev:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: robins-reserve:1.4.0-dev
+    container_name: robins-squarespace-import-dev
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        sleep 20
+        while true; do
+          python tasks/squarespace_import.py --days 30
+          sleep 300
+        done
+    env_file:
+      - ../../.env.dev
+    volumes:
+      - robins_dev_data:/app/data
+      - robins_dev_logs:/app/logs
+      - ../../secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
+    depends_on:
+      robins-api-dev:
+        condition: service_healthy
+    networks:
+      - default
+    security_opt:
+      - no-new-privileges:true
+
   robins-api-dev:
     build:
       context: ../..
