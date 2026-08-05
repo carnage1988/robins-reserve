@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -8,6 +9,7 @@ from discord.ext import commands
 from config import STAFF_CHANNEL_ID, STAFF_ROLE_ID
 from app.runtime import bot, sheets, pending_requests, pending_quantity_requests, customer_baskets, save_pending_requests, is_staff_channel
 from cogs.league import has_league_role
+from services.internal_events import notify_internal_event
 logger=logging.getLogger(__name__)
 
 def format_datetime(timestamp: str) -> str:
@@ -128,6 +130,13 @@ async def add_to_basket(
     for item in basket:
         if item["product_id"] == product["product_id"]:
             item["quantity"] += quantity
+            unit_price = product.get("unit_price")
+            item["unit_price"] = unit_price
+            if unit_price is not None:
+                item["subtotal"] = round(
+                    float(unit_price) * int(item["quantity"]),
+                    2,
+                )
             break
     else:
         basket.append(
@@ -136,6 +145,12 @@ async def add_to_basket(
                 "product_name": product["product_name"],
                 "order_code": product["order_code"],
                 "quantity": quantity,
+                "unit_price": product.get("unit_price"),
+                "subtotal": (
+                    round(float(product["unit_price"]) * quantity, 2)
+                    if product.get("unit_price") is not None
+                    else None
+                ),
                 "league_only": product.get("league_only", False),
             }
         )
@@ -313,6 +328,11 @@ async def submit_basket(message: discord.Message) -> None:
     customer_baskets.pop(message.author.id, None)
     pending_quantity_requests.pop(message.author.id, None)
 
+    await asyncio.to_thread(
+        notify_internal_event,
+        "preorder.awaiting_approval",
+    )
+
     await message.channel.send(
         "✅ **Your preorder stock has been reserved.**\n\n"
         f"{format_items(reserved_order['items'])}\n\n"
@@ -446,6 +466,11 @@ async def process_preorder_dm(message: discord.Message) -> None:
                     logger.warning(
                         "Could not update the cancelled approval message"
                     )
+
+        await asyncio.to_thread(
+            notify_internal_event,
+            "preorder.cancelled",
+        )
 
         await message.channel.send(
             "🚫 **Your preorder has been cancelled.**\n\n"
@@ -872,6 +897,11 @@ async def on_raw_reaction_add(
                     "Could not update the rejection message"
                 )
 
+    await asyncio.to_thread(
+        notify_internal_event,
+        "preorder.approved" if reaction == "👍" else "preorder.declined",
+    )
+
     pending_requests.pop(payload.message_id, None)
     save_pending_requests()
 
@@ -1070,6 +1100,10 @@ async def staff_cancel(
     )
     embed.add_field(name="Reason", value=reason, inline=False)
     await ctx.send(embed=embed)
+    await asyncio.to_thread(
+        notify_internal_event,
+        "preorder.cancelled",
+    )
 
 
 @bot.command(name="collect")
@@ -1166,6 +1200,10 @@ async def collect(
     )
 
     await ctx.send(embed=embed)
+    await asyncio.to_thread(
+        notify_internal_event,
+        "preorder.collected",
+    )
 
 
 @bot.command(name="ping")
@@ -1252,6 +1290,7 @@ async def products(ctx: commands.Context) -> None:
         lines.append(
             "\n"
             f"**{product['product_name']}**\n"
+            f"Price: **{format_currency(product.get('unit_price'))}**\n"
             f"Order code: "
             f"`{product['order_code']}`\n"
             f"Stock: {product['stock']}\n"

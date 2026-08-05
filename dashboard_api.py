@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Callable, TypeVar
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +28,7 @@ from services.league_service import LeagueService
 from services.sheets_service import SheetsService
 from services.robincon_service import RobinConService
 from services.robincon_staff_service import RobinConStaffService
+from services.dashboard_cache import DashboardCache
 
 import logging
 
@@ -37,7 +38,7 @@ install_gspread_resilience()
 
 
 APP_NAME = "Robins Reserve Operations API"
-APP_VERSION = "1.4.0-dev"
+APP_VERSION = "1.4.2-dev"
 LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
 DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY", "").strip()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
@@ -64,6 +65,64 @@ SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "robins_staff_session").s
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:10000").rstrip("/")
 BOT_HEARTBEAT_FILE = Path(os.getenv("BOT_HEARTBEAT_FILE", "/app/data/discord_bot_heartbeat.json"))
 BOT_HEARTBEAT_MAX_AGE = int(os.getenv("BOT_HEARTBEAT_MAX_AGE", "120"))
+
+DASHBOARD_CACHE_ENABLED = os.getenv(
+    "DASHBOARD_CACHE_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+DASHBOARD_CACHE_TTL_SECONDS = int(
+    os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "60")
+)
+DASHBOARD_CACHE_STALE_SECONDS = int(
+    os.getenv("DASHBOARD_CACHE_STALE_SECONDS", "300")
+)
+INTERNAL_CACHE_TOKEN = os.getenv("INTERNAL_CACHE_TOKEN", "").strip()
+
+dashboard_cache = DashboardCache(
+    enabled=DASHBOARD_CACHE_ENABLED,
+    ttl_seconds=DASHBOARD_CACHE_TTL_SECONDS,
+    stale_seconds=DASHBOARD_CACHE_STALE_SECONDS,
+)
+
+EVENT_CACHE_MAP: dict[str, tuple[str, ...]] = {
+    "preorder.awaiting_approval": ("dashboard", "service_health"),
+    "preorder.approved": ("dashboard", "service_health"),
+    "preorder.declined": ("dashboard", "service_health"),
+    "preorder.cancelled": ("dashboard", "service_health"),
+    "preorder.collected": ("dashboard", "service_health"),
+    "league.started": ("dashboard", "league_status", "service_health"),
+    "league.ended": ("dashboard", "league_status", "service_health"),
+    "league.checkin": ("dashboard", "league_status"),
+    "robincon.updated": ("dashboard", "service_health"),
+    "squarespace.imported": ("dashboard", "service_health"),
+}
+
+T = TypeVar("T")
+
+
+def _cached_value(key: str, loader: Callable[[], T]) -> T:
+    """Return only the cached payload, preserving existing API response shapes."""
+
+    result = dashboard_cache.get_or_load(key, loader)
+    logger.debug(
+        "Dashboard cache key=%s status=%s age_seconds=%s",
+        key,
+        result.cache_status,
+        result.age_seconds,
+    )
+    return result.value
+
+
+def _invalidate_for_event(event: str) -> int:
+    keys = EVENT_CACHE_MAP.get(event, ("dashboard",))
+    removed = dashboard_cache.invalidate(*keys)
+    logger.info(
+        "Internal event %s invalidated cache keys=%s removed=%s",
+        event,
+        keys,
+        removed,
+    )
+    return removed
 
 
 def _cors_origins() -> list[str]:
@@ -99,7 +158,30 @@ async def protect_staff_api(request: Request, call_next):
         return JSONResponse(status_code=403, content={"detail": "Untrusted request origin."})
     if request.url.path.startswith("/api/") and not request.session.get("staff_user"):
         return JSONResponse(status_code=401, content={"detail": "Discord login required."})
-    return await call_next(request)
+
+    response = await call_next(request)
+
+    if response.status_code < 400 and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        path = request.url.path
+        if path.startswith("/api/reservations/"):
+            action = path.rsplit("/", 1)[-1]
+            event = {
+                "approve": "preorder.approved",
+                "decline": "preorder.declined",
+                "reject": "preorder.declined",
+                "cancel": "preorder.cancelled",
+                "collect": "preorder.collected",
+            }.get(action)
+            if event:
+                _invalidate_for_event(event)
+        elif path == "/api/league/start":
+            _invalidate_for_event("league.started")
+        elif path == "/api/league/end":
+            _invalidate_for_event("league.ended")
+        elif path.startswith("/api/robincon/"):
+            _invalidate_for_event("robincon.updated")
+
+    return response
 
 app.add_middleware(
     SessionMiddleware,
@@ -116,7 +198,7 @@ app.add_middleware(
     allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Internal-Token"],
 )
 
 
@@ -546,6 +628,34 @@ def _group_reservations(
     return sorted(reservations, key=sort_key, reverse=True)
 
 
+class InternalEventRequest(BaseModel):
+    event: str = Field(min_length=1, max_length=100)
+
+
+@app.post("/internal/event")
+def internal_event(
+    payload: InternalEventRequest,
+    x_internal_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Invalidate dashboard cache entries after an application write."""
+
+    if not INTERNAL_CACHE_TOKEN or not secrets.compare_digest(
+        x_internal_token or "",
+        INTERNAL_CACHE_TOKEN,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid internal event token.",
+        )
+
+    removed = _invalidate_for_event(payload.event)
+    return {
+        "accepted": True,
+        "event": payload.event,
+        "invalidated_entries": removed,
+    }
+
+
 @app.get("/auth/discord/login")
 def discord_login(request: Request) -> RedirectResponse:
     if not _oauth_configured():
@@ -687,11 +797,11 @@ def health() -> dict[str, Any]:
         "discord_bot": bot_health["connected"],
         "discord_bot_heartbeat_age_seconds": bot_health["age_seconds"],
         "spreadsheet": connection,
+        "dashboard_cache": dashboard_cache.health(),
     }
 
 
-@app.get("/api/service-health")
-def service_health() -> dict[str, Any]:
+def _load_service_health() -> dict[str, Any]:
     sheets_ok = False
     sheets_message = "Connection unavailable"
     if sheets is not None:
@@ -722,8 +832,12 @@ def service_health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/dashboard")
-def dashboard() -> dict[str, Any]:
+@app.get("/api/service-health")
+def service_health() -> dict[str, Any]:
+    return _cached_value("service_health", _load_service_health)
+
+
+def _load_dashboard() -> dict[str, Any]:
     service, league_service = require_services()
     reservations = _group_reservations(service, "active")
     all_reservations = _group_reservations(service, "all")
@@ -769,6 +883,11 @@ def dashboard() -> dict[str, Any]:
         ][:12],
         "recent_activity": all_reservations[:12],
     }
+
+
+@app.get("/api/dashboard")
+def dashboard() -> dict[str, Any]:
+    return _cached_value("dashboard", _load_dashboard)
 
 
 @app.get("/api/reservations")
@@ -962,10 +1081,14 @@ def products(
     return rows
 
 
-@app.get("/api/league/status")
-def league_status() -> dict[str, Any]:
+def _load_league_status() -> dict[str, Any]:
     _, league_service = require_services()
     return league_service.get_league_status()
+
+
+@app.get("/api/league/status")
+def league_status() -> dict[str, Any]:
+    return _cached_value("league_status", _load_league_status)
 
 
 @app.get("/api/league/attendance")

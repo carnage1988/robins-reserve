@@ -244,6 +244,17 @@ class RobinConLinkModal(discord.ui.Modal, title="Link RobinCon Ticket"):
         )
 
 
+def _premium_event_allowance(ticket: dict[str, Any]) -> int:
+    """Return the ticket's configured premium-event allowance."""
+
+    try:
+        allowance = int(ticket.get("Premium Event Allowance", 0) or 0)
+    except (TypeError, ValueError):
+        allowance = 0
+
+    return max(0, min(allowance, 2))
+
+
 def build_robincon_registration_complete_embed(
     ticket: dict[str, Any],
 ) -> discord.Embed:
@@ -266,18 +277,29 @@ def build_robincon_registration_complete_embed(
         value=str(ticket.get("T-Shirt Size", "Not selected")) or "Not selected",
         inline=False,
     )
-    embed.add_field(
-        name="Saturday Premium Event",
-        value=str(ticket.get("Saturday Event Name", "Not selected"))
-        or "Not selected",
-        inline=False,
-    )
-    embed.add_field(
-        name="Sunday Premium Event",
-        value=str(ticket.get("Sunday Event Name", "Not selected"))
-        or "Not selected",
-        inline=False,
-    )
+
+    saturday_name = str(ticket.get("Saturday Event Name", "")).strip()
+    sunday_name = str(ticket.get("Sunday Event Name", "")).strip()
+
+    if saturday_name:
+        embed.add_field(
+            name="Saturday Premium Event",
+            value=saturday_name,
+            inline=False,
+        )
+    if sunday_name:
+        embed.add_field(
+            name="Sunday Premium Event",
+            value=sunday_name,
+            inline=False,
+        )
+    if not saturday_name and not sunday_name:
+        embed.add_field(
+            name="Premium Event",
+            value="No premium event included",
+            inline=False,
+        )
+
     completed_at = str(ticket.get("Registration Completed At", "")).strip()
     if completed_at:
         embed.add_field(
@@ -315,30 +337,40 @@ async def start_robincon_registration(
             await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
+    allowance = _premium_event_allowance(ticket)
+
     try:
-        tshirt_open, events_open, sizes, saturday_events, sunday_events = (
-            await asyncio.gather(
-                asyncio.to_thread(robincon_service.is_tshirt_selection_open),
-                asyncio.to_thread(robincon_service.is_premium_event_registration_open),
-                asyncio.to_thread(robincon_service.get_enabled_tshirt_sizes),
-                asyncio.to_thread(robincon_service.get_active_saturday_events),
-                asyncio.to_thread(robincon_service.get_active_sunday_events),
-            )
+        tshirt_open, sizes, saturday_events, sunday_events = await asyncio.gather(
+            asyncio.to_thread(robincon_service.is_tshirt_selection_open),
+            asyncio.to_thread(robincon_service.get_enabled_tshirt_sizes),
+            asyncio.to_thread(robincon_service.get_active_saturday_events),
+            asyncio.to_thread(robincon_service.get_active_sunday_events),
         )
         if not tshirt_open:
             raise ValueError("RobinCon T-shirt selection is currently closed.")
-        if not events_open:
-            raise ValueError("RobinCon premium-event registration is currently closed.")
         if not sizes:
             raise ValueError("No RobinCon T-shirt sizes are currently available.")
-        if not saturday_events:
-            raise ValueError("No Saturday premium events are currently available.")
-        if not sunday_events:
-            raise ValueError("No Sunday premium events are currently available.")
-        if len(sizes) > 25 or len(saturday_events) > 25 or len(sunday_events) > 25:
-            raise ValueError(
-                "A registration list contains more than Discord's 25-option limit."
+        if allowance > 0:
+            events_open = await asyncio.to_thread(
+                robincon_service.is_premium_event_registration_open
             )
+            if not events_open:
+                raise ValueError("RobinCon premium-event registration is currently closed.")
+        if allowance == 1 and not (saturday_events or sunday_events):
+            raise ValueError("No RobinCon premium events are currently available.")
+        if allowance >= 2:
+            if not saturday_events:
+                raise ValueError("No Saturday premium events are currently available.")
+            if not sunday_events:
+                raise ValueError("No Sunday premium events are currently available.")
+        if len(sizes) > 25:
+            raise ValueError("The T-shirt size list exceeds Discord's 25-option limit.")
+        if allowance == 1 and len(saturday_events) + len(sunday_events) > 25:
+            raise ValueError(
+                "The combined premium-event list exceeds Discord's 25-option limit."
+            )
+        if allowance >= 2 and (len(saturday_events) > 25 or len(sunday_events) > 25):
+            raise ValueError("A premium-event list exceeds Discord's 25-option limit.")
     except ValueError as exc:
         message = f"❌ {exc}"
         if edit_original:
@@ -361,13 +393,15 @@ async def start_robincon_registration(
         sizes=sizes,
         saturday_events=saturday_events,
         sunday_events=sunday_events,
+        allowance=allowance,
     )
     attendee = str(ticket.get("Ticket Holder Name", "")).strip() or "Attendee"
     current_size = str(ticket.get("T-Shirt Size", "")).strip()
     message = (
-        "**RobinCon Registration — Step 1 of 4**\n\n"
+        f"**RobinCon Registration — Step 1 of {state.total_steps}**\n\n"
         f"✅ Attendee: **{attendee}**\n"
-        f"✅ Ticket: `{ticket.get('Ticket ID', 'Unknown')}`\n\n"
+        f"✅ Ticket: `{ticket.get('Ticket ID', 'Unknown')}`\n"
+        f"✅ Premium-event allowance: **{allowance}**\n\n"
         "Choose the T-shirt size included with this ticket."
     )
     if current_size:
@@ -375,15 +409,11 @@ async def start_robincon_registration(
     registration_view = RobinConTShirtStepView(state)
     if edit_original:
         await interaction.response.edit_message(
-            content=message,
-            embed=None,
-            view=registration_view,
+            content=message, embed=None, view=registration_view
         )
     else:
         await interaction.followup.send(
-            message,
-            view=registration_view,
-            ephemeral=True,
+            message, view=registration_view, ephemeral=True
         )
 
 
@@ -458,18 +488,90 @@ class RobinConRegistrationState:
         sizes: list[dict[str, Any]],
         saturday_events: list[dict[str, Any]],
         sunday_events: list[dict[str, Any]],
+        allowance: int,
     ) -> None:
         self.owner_id = owner_id
         self.ticket = ticket
         self.sizes = sizes
         self.saturday_events = saturday_events
         self.sunday_events = sunday_events
+        self.allowance = allowance
         self.tshirt_size_id = ""
         self.tshirt_size_name = ""
         self.saturday_event_id = ""
         self.saturday_event_name = ""
         self.sunday_event_id = ""
         self.sunday_event_name = ""
+
+    @property
+    def total_steps(self) -> int:
+        if self.allowance <= 0:
+            return 2
+        if self.allowance == 1:
+            return 3
+        return 4
+
+    @property
+    def combined_events(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for event in self.saturday_events:
+            item = dict(event)
+            item["_RobinCon Day"] = "Saturday"
+            events.append(item)
+        for event in self.sunday_events:
+            item = dict(event)
+            item["_RobinCon Day"] = "Sunday"
+            events.append(item)
+        return events
+
+
+def build_robincon_registration_review(
+    state: RobinConRegistrationState,
+) -> discord.Embed:
+    """Build the final registration review."""
+
+    review = discord.Embed(
+        title="📋 RobinCon Registration Review",
+        description=(
+            f"Ticket `{state.ticket.get('Ticket ID', 'Unknown')}`\n\n"
+            "Review the choices below carefully. Once confirmed, they "
+            "will be locked and cannot be changed through Discord."
+        ),
+    )
+    review.add_field(name="T-Shirt", value=state.tshirt_size_name, inline=False)
+    if state.saturday_event_name:
+        review.add_field(
+            name="Saturday Premium Event",
+            value=state.saturday_event_name,
+            inline=False,
+        )
+    if state.sunday_event_name:
+        review.add_field(
+            name="Sunday Premium Event",
+            value=state.sunday_event_name,
+            inline=False,
+        )
+    if not state.saturday_event_name and not state.sunday_event_name:
+        review.add_field(
+            name="Premium Event",
+            value="No premium event included",
+            inline=False,
+        )
+    return review
+
+
+async def show_robincon_registration_review(
+    interaction: discord.Interaction,
+    state: RobinConRegistrationState,
+) -> None:
+    await interaction.response.edit_message(
+        content=(
+            f"**RobinCon Registration — Step {state.total_steps} "
+            f"of {state.total_steps}**"
+        ),
+        embed=build_robincon_registration_review(state),
+        view=RobinConRegistrationConfirmView(state),
+    )
 
 
 class RobinConRegistrationSelect(discord.ui.Select):
@@ -520,6 +622,20 @@ class RobinConRegistrationSelect(discord.ui.Select):
             self.state.tshirt_size_name = str(
                 selected.get("Display Name", selected_value)
             )
+            if self.state.allowance <= 0:
+                await show_robincon_registration_review(interaction, self.state)
+                return
+            if self.state.allowance == 1:
+                await interaction.response.edit_message(
+                    content=(
+                        "**RobinCon Registration — Step 2 of 3**\n\n"
+                        f"✅ T-shirt: **{self.state.tshirt_size_name}**\n\n"
+                        "Choose one premium event from either day."
+                    ),
+                    embed=None,
+                    view=RobinConSingleEventView(self.state),
+                )
+                return
             await interaction.response.edit_message(
                 content=(
                     "**RobinCon Registration — Step 2 of 4**\n\n"
@@ -529,6 +645,32 @@ class RobinConRegistrationSelect(discord.ui.Select):
                 embed=None,
                 view=RobinConSaturdayEventView(self.state),
             )
+            return
+
+        if self.step == "single_event":
+            selected = next(
+                (
+                    item
+                    for item in self.state.combined_events
+                    if str(item.get("Event ID", "")) == selected_value
+                ),
+                None,
+            )
+            if selected is None:
+                await interaction.response.send_message(
+                    "❌ That premium event is no longer available.",
+                    ephemeral=True,
+                )
+                return
+            day = str(selected.get("_RobinCon Day", "")).strip()
+            event_name = str(selected.get("Event Name", selected_value))
+            if day == "Saturday":
+                self.state.saturday_event_id = selected_value
+                self.state.saturday_event_name = event_name
+            else:
+                self.state.sunday_event_id = selected_value
+                self.state.sunday_event_name = event_name
+            await show_robincon_registration_review(interaction, self.state)
             return
 
         if self.step == "saturday":
@@ -580,34 +722,7 @@ class RobinConRegistrationSelect(discord.ui.Select):
         self.state.sunday_event_name = str(
             selected.get("Event Name", selected_value)
         )
-        review = discord.Embed(
-            title="📋 RobinCon Registration Review",
-            description=(
-                f"Ticket `{self.state.ticket.get('Ticket ID', 'Unknown')}`\n\n"
-                "Review the choices below carefully. Once confirmed, they "
-                "will be locked and cannot be changed through Discord."
-            ),
-        )
-        review.add_field(
-            name="T-Shirt",
-            value=self.state.tshirt_size_name,
-            inline=False,
-        )
-        review.add_field(
-            name="Saturday Premium Event",
-            value=self.state.saturday_event_name,
-            inline=False,
-        )
-        review.add_field(
-            name="Sunday Premium Event",
-            value=self.state.sunday_event_name,
-            inline=False,
-        )
-        await interaction.response.edit_message(
-            content="**RobinCon Registration — Step 4 of 4**",
-            embed=review,
-            view=RobinConRegistrationConfirmView(self.state),
-        )
+        await show_robincon_registration_review(interaction, self.state)
 
 
 class RobinConTShirtStepView(discord.ui.View):
@@ -631,6 +746,33 @@ class RobinConTShirtStepView(discord.ui.View):
                 step="tshirt",
                 options=options,
                 placeholder="Choose your RobinCon T-shirt size",
+            )
+        )
+
+
+class RobinConSingleEventView(discord.ui.View):
+    def __init__(self, state: RobinConRegistrationState) -> None:
+        super().__init__(timeout=600)
+        options = []
+        for event in state.combined_events:
+            day = str(event.get("_RobinCon Day", "")).strip()
+            name = str(event.get("Event Name", "Premium Event")).strip()
+            options.append(
+                discord.SelectOption(
+                    label=f"{day} — {name}"[:100],
+                    value=str(event.get("Event ID", "")),
+                    description=(
+                        f"{event.get('Start Time', '')}–"
+                        f"{event.get('End Time', '')}"
+                    )[:100],
+                )
+            )
+        self.add_item(
+            RobinConRegistrationSelect(
+                state=state,
+                step="single_event",
+                options=options,
+                placeholder="Choose one premium event",
             )
         )
 
@@ -708,7 +850,6 @@ class RobinConRegistrationConfirmView(discord.ui.View):
                 ephemeral=True,
             )
             return
-
         button.disabled = True
         await interaction.response.edit_message(view=self)
         try:
@@ -735,11 +876,9 @@ class RobinConRegistrationConfirmView(discord.ui.View):
                 ephemeral=True,
             )
             return
-
         await interaction.edit_original_response(
             content=None,
             embed=build_robincon_registration_complete_embed(ticket),
             view=None,
         )
-
 
