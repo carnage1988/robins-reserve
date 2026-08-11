@@ -1,9 +1,15 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Customer, LeagueAttendance, LeagueSession
+from models import (
+    Customer,
+    LeagueAttendance,
+    LeagueSession,
+    LeagueTemplate,
+)
 
 
 class LeagueDatabaseService:
@@ -60,6 +66,95 @@ class LeagueDatabaseService:
             raise ValueError(
                 "There is no active PostgreSQL League session."
             )
+
+        return league_session
+
+    @staticmethod
+    async def start_session(
+        session: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        store_id: uuid.UUID,
+        template_name: str,
+        duration_hours: int,
+        created_by: uuid.UUID | None = None,
+    ) -> LeagueSession:
+        existing = (
+            await session.execute(
+                select(LeagueSession).where(
+                    LeagueSession.tenant_id == tenant_id,
+                    LeagueSession.store_id == store_id,
+                    LeagueSession.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+
+        if existing is not None:
+            raise ValueError(
+                "A PostgreSQL League session is already active."
+            )
+
+        league_template = (
+            await session.execute(
+                select(LeagueTemplate).where(
+                    LeagueTemplate.tenant_id == tenant_id,
+                    LeagueTemplate.name == template_name,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if league_template is None:
+            raise ValueError(
+                f"League template '{template_name}' was not found."
+            )
+
+        starts_at = datetime.now(timezone.utc)
+        ends_at = starts_at + timedelta(hours=duration_hours)
+
+        league_session = LeagueSession(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            store_id=store_id,
+            league_template_id=league_template.id,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            entry_fee=league_template.default_entry_fee,
+            currency=league_template.currency,
+            status="active",
+            created_by=created_by,
+        )
+
+        session.add(league_session)
+        await session.flush()
+
+        return league_session
+
+    @staticmethod
+    async def end_active_session(
+        session: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        store_id: uuid.UUID,
+    ) -> LeagueSession:
+        league_session = (
+            await session.execute(
+                select(LeagueSession).where(
+                    LeagueSession.tenant_id == tenant_id,
+                    LeagueSession.store_id == store_id,
+                    LeagueSession.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+
+        if league_session is None:
+            raise ValueError(
+                "There is no active PostgreSQL League session."
+            )
+
+        league_session.status = "closed"
+        league_session.ends_at = datetime.now(timezone.utc)
+
+        await session.flush()
 
         return league_session
 

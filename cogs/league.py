@@ -1,4 +1,5 @@
 from __future__ import annotations
+import uuid
 
 import logging
 
@@ -6,6 +7,9 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 from sqlalchemy import select
+
+from models import Payment, Store, Tenant, User
+from services.payment_service import PaymentService
 
 from config import LEAGUE_GUILD_ID, LEAGUE_CHANNEL_ID, LEAGUE_EVENT_DURATION_HOURS, LEAGUE_ROLE_ID, LEAGUE_WINDOW_DAYS, STAFF_ROLE_ID
 from app.runtime import bot, league_service
@@ -458,6 +462,7 @@ async def league_start(
 
     await interaction.response.defer(ephemeral=True)
 
+    # Existing Google Sheets event
     try:
         event = league_service.start_event()
     except ValueError as exc:
@@ -471,7 +476,51 @@ async def league_start(
         )
         return
 
+    # Matching PostgreSQL League session
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(Tenant.slug == "robins")
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            db_session = await LeagueDatabaseService.start_session(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+                template_name="Pokémon Weekly League",
+                duration_hours=LEAGUE_EVENT_DURATION_HOURS,
+                created_by=None,
+            )
+
+            await session.commit()
+
+    except Exception:
+        logger.exception(
+            "PostgreSQL League session creation failed"
+        )
+
+        await interaction.followup.send(
+            (
+                "⚠️ The Sheets League event started, "
+                "but the PostgreSQL League session could not be created."
+            ),
+            ephemeral=True,
+        )
+        return
+
     channel = bot.get_channel(LEAGUE_CHANNEL_ID)
+
     if not isinstance(channel, discord.TextChannel):
         await interaction.followup.send(
             "❌ The event started, but the League channel was not found.",
@@ -483,16 +532,19 @@ async def league_start(
         (
             "**League event started.**\n\n"
             f"**Event ID:** `{event['event_id']}`\n"
-            f"**Store Code:** `{event['store_code']}`\n\n"
+            f"**Store Code:** `{event['store_code']}`\n"
+            f"**Entry Fee:** `£{db_session.entry_fee:.2f}`\n\n"
             f"This event expires in {LEAGUE_EVENT_DURATION_HOURS} hours."
         )
     )
 
     await interaction.followup.send(
-        "✅ League event started and the store code was posted.",
+        (
+            "✅ League event started.\n\n"
+            f"PostgreSQL Session: `{db_session.id}`"
+        ),
         ephemeral=True,
     )
-
 
 @league_group.command(
     name="end",
@@ -508,10 +560,14 @@ async def league_end(
 
     await interaction.response.defer(ephemeral=True)
 
+    # Close the existing Google Sheets event.
     try:
         event = league_service.close_active_event()
     except ValueError as exc:
-        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+        await interaction.followup.send(
+            f"❌ {exc}",
+            ephemeral=True,
+        )
         return
     except Exception:
         logger.exception("Failed to end League event")
@@ -521,18 +577,57 @@ async def league_end(
         )
         return
 
-    channel = bot.get_channel(LEAGUE_CHANNEL_ID)
-    if isinstance(channel, discord.TextChannel):
-        await channel.send(
-            (
-                "**League event ended.**\n\n"
-                f"**Event ID:** `{event.get('Event ID', 'Unknown')}`\n\n"
-                "Players can no longer check in."
+    # Close the matching PostgreSQL League session.
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            db_session = (
+                await LeagueDatabaseService.end_active_session(
+                    session,
+                    tenant_id=tenant.id,
+                    store_id=store.id,
+                )
             )
+
+            await session.commit()
+
+    except Exception:
+        logger.exception(
+            "PostgreSQL League session closure failed"
         )
 
+        await interaction.followup.send(
+            (
+                "⚠️ The League event was closed in Google Sheets, "
+                "but the PostgreSQL session could not be closed."
+            ),
+            ephemeral=True,
+        )
+        return
+
     await interaction.followup.send(
-        "✅ League event ended.",
+        (
+            "✅ **League event ended.**\n\n"
+            f"Event ID: `{event.get('Event ID', 'Unknown')}`\n"
+            f"PostgreSQL Session: `{db_session.id}`\n"
+            "Session Status: `closed`"
+        ),
         ephemeral=True,
     )
 
@@ -636,6 +731,123 @@ async def league_staff_checkin(
             f"✅ {member.mention} checked in to event "
             f"`{result['event_id']}`.\n"
             f"Role updated: `{'Yes' if role_added else 'No'}`"
+        ),
+        ephemeral=True,
+    )
+
+@league_group.command(
+    name="cash-paid",
+    description="Confirm that a League cash payment has been received.",
+)
+@app_commands.describe(
+    payment_reference="The payment reference shown on the customer's confirmation."
+)
+async def league_cash_paid(
+    interaction: discord.Interaction,
+    payment_reference: str,
+) -> None:
+    """Confirm a pending League cash payment."""
+
+    if await validate_league_staff(interaction) is None:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        payment_id = uuid.UUID(payment_reference.strip())
+    except ValueError:
+        await interaction.followup.send(
+            "❌ That payment reference is not valid.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(Tenant.slug == "robins")
+                )
+            ).scalar_one()
+
+            staff_user = (
+                await session.execute(
+                    select(User).where(
+                        User.tenant_id == tenant.id,
+                        User.discord_user_id == str(interaction.user.id),
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if staff_user is None:
+                await interaction.followup.send(
+                    (
+                        "❌ Your Discord account is not linked to a "
+                        "RobinHub staff user."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            payment = (
+                await session.execute(
+                    select(Payment).where(
+                        Payment.id == payment_id,
+                        Payment.tenant_id == tenant.id,
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if payment is None:
+                await interaction.followup.send(
+                    "❌ That payment could not be found.",
+                    ephemeral=True,
+                )
+                return
+
+            payment = await PaymentService.confirm_cash_payment(
+                session,
+                payment_id=payment.id,
+                confirmed_by=staff_user.id,
+            )
+
+            await session.commit()
+
+    except PermissionError:
+        await interaction.followup.send(
+            (
+                "❌ You do not have permission to confirm "
+                "cash payments."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    except ValueError as exc:
+        await interaction.followup.send(
+            f"❌ {exc}",
+            ephemeral=True,
+        )
+        return
+
+    except Exception:
+        logger.exception(
+            "Failed to confirm League cash payment %s",
+            payment_reference,
+        )
+        await interaction.followup.send(
+            "❌ The cash payment could not be confirmed.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        (
+            "✅ **Cash payment confirmed.**\n\n"
+            f"Payment Reference: `{payment.id}`\n"
+            f"Amount: **£{payment.amount:.2f}**\n"
+            "Status: **Paid**\n"
+            f"Confirmed by: **{interaction.user.display_name}**"
         ),
         ephemeral=True,
     )
