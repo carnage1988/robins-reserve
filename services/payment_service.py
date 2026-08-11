@@ -137,3 +137,70 @@ class PaymentService:
 
         await session.flush()
         return payment
+
+    @classmethod
+    async def comp_payment(
+        cls,
+        session: AsyncSession,
+        *,
+        payment_id: uuid.UUID,
+        confirmed_by: uuid.UUID,
+        reason: str,
+    ) -> Payment:
+        clean_reason = reason.strip()
+
+        if not clean_reason:
+            raise ValueError("A comp reason is required.")
+
+        allowed = await cls._user_has_permission(
+            session,
+            user_id=confirmed_by,
+            permission_code="payments.comp",
+        )
+
+        if not allowed:
+            raise PermissionError(
+                "User does not have permission to comp payments."
+            )
+
+        payment = (
+            await session.execute(
+                select(Payment).where(Payment.id == payment_id)
+            )
+        ).scalar_one_or_none()
+
+        if payment is None:
+            raise ValueError("Payment not found.")
+
+        if payment.status not in {"cash_due", "pending"}:
+            raise ValueError(
+                f"Payment cannot be comped from status {payment.status}."
+            )
+
+        old_status = payment.status
+        now = datetime.now(timezone.utc)
+
+        payment.status = "comped"
+        payment.confirmed_by = confirmed_by
+        payment.confirmed_at = now
+
+        await AuditService.record(
+            session,
+            tenant_id=payment.tenant_id,
+            store_id=payment.store_id,
+            user_id=confirmed_by,
+            action="payment.comped",
+            entity_type="payment",
+            entity_id=payment.id,
+            old_values={
+                "status": old_status,
+            },
+            new_values={
+                "status": "comped",
+                "reason": clean_reason,
+            },
+        )
+
+        await session.flush()
+
+        return payment

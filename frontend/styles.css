@@ -91,7 +91,28 @@ a { color: inherit; }
 .header-actions { display:flex; gap:10px; flex-wrap:wrap; }
 
 .grid { display: grid; gap: 16px; }
-.stats-grid { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.stat-card {
+  min-height: 110px;
+}
+
+@media (max-width: 900px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .two-col { grid-template-columns: minmax(0, 1.55fr) minmax(300px, .75fr); }
 .stat-card, .panel {
   background: linear-gradient(180deg, rgba(255,255,255,.012), transparent), var(--panel);
@@ -522,3 +543,23 @@ tr:hover td { background:rgba(255,255,255,.018); }
 .topbar .staff-user{gap:12px;margin-right:18px}
 .staff-avatar{width:38px;height:38px;min-width:38px;border-radius:50%;object-fit:cover;display:inline-flex;align-items:center;justify-content:center}
 @media (max-width: 780px){.topbar .environment-pill{margin-left:8px;margin-right:8px}.topbar .staff-user{margin-right:8px}}
+.league-payments-table .record-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 0;
+}
+
+.league-payments-table td {
+    vertical-align: middle;
+}
+
+.league-payments-table th:last-child,
+.league-payments-table td:last-child {
+    min-width: 300px;
+}
+
+.league-payments-table .status-pill {
+    white-space: nowrap;
+}

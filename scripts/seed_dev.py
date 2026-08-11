@@ -43,6 +43,10 @@ PERMISSIONS = [
         "dashboard.configure",
         "Configure dashboard layouts and widgets.",
     ),
+    (
+        "payments.comp",
+        "Comp or waive a customer payment.",
+    ),
 ]
 
 
