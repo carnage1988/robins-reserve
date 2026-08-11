@@ -1,10 +1,19 @@
 from __future__ import annotations
+
 import logging
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from sqlalchemy import select
+
 from config import LEAGUE_GUILD_ID, LEAGUE_CHANNEL_ID, LEAGUE_EVENT_DURATION_HOURS, LEAGUE_ROLE_ID, LEAGUE_WINDOW_DAYS, STAFF_ROLE_ID
 from app.runtime import bot, league_service
+from models import Store, Tenant
+from services.database import AsyncSessionLocal
+from services.league_db_service import LeagueDatabaseService
+from views.league_payment import LeaguePaymentView
+
 logger=logging.getLogger(__name__)
 
 def get_league_guild() -> discord.Guild | None:
@@ -261,6 +270,7 @@ async def league_checkin_command(
 
     await interaction.response.defer(ephemeral=True)
 
+    # Existing Google Sheets-backed check-in.
     try:
         result = league_service.check_in_player(
             discord_user_id=interaction.user.id,
@@ -277,6 +287,84 @@ async def league_checkin_command(
         )
         return
 
+    # New PostgreSQL-backed attendance/payment preparation.
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(Tenant.slug == "robins")
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            customer = await LeagueDatabaseService.get_or_create_customer(
+                session,
+                tenant_id=tenant.id,
+                discord_user_id=interaction.user.id,
+                display_name=interaction.user.display_name,
+            )
+
+            db_league_session = await LeagueDatabaseService.get_active_session(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+            )
+
+            attendance = await LeagueDatabaseService.check_in_customer(
+                session,
+                league_session_id=db_league_session.id,
+                customer_id=customer.id,
+                checkin_method="discord",
+            )
+
+            await session.commit()
+
+            payment_view = LeaguePaymentView(
+                tenant_id=tenant.id,
+                store_id=store.id,
+                customer_id=customer.id,
+                attendance_id=attendance.id,
+                amount=db_league_session.entry_fee,
+                currency=db_league_session.currency,
+            )
+
+    except ValueError as exc:
+        logger.warning(
+            "PostgreSQL League check-in validation failed for user %s: %s",
+            interaction.user.id,
+            exc,
+        )
+        await interaction.followup.send(
+            (
+                "⚠️ Your League attendance was recorded, "
+                "but the payment step could not be prepared.\n\n"
+                f"Reason: {exc}"
+            ),
+            ephemeral=True,
+        )
+        return
+    except Exception:
+        logger.exception(
+            "PostgreSQL League check-in integration failed for user %s",
+            interaction.user.id,
+        )
+        await interaction.followup.send(
+            (
+                "⚠️ Your League attendance was recorded, "
+                "but the payment system could not be loaded."
+            ),
+            ephemeral=True,
+        )
+        return
+
     role_added = await apply_league_role(interaction.user.id)
     role_message = (
         "Your League Player role has been added or renewed."
@@ -287,11 +375,14 @@ async def league_checkin_command(
     await interaction.followup.send(
         (
             "✅ **League check-in complete.**\n\n"
-            f"Event ID: `{result['event_id']}`\n"
-            f"Player ID: `{result['player_id']}`\n\n"
+            f"Player ID: `{result['player_id']}`\n"
+            "League: **Pokémon Weekly League**\n"
+            f"Entry Fee: **£{db_league_session.entry_fee:.2f}**\n\n"
+            "**How would you like to pay?**\n\n"
             f"{role_message}"
         ),
-        ephemeral=True,
+        view=payment_view,
+        ephemeral=False,
     )
 
 
@@ -651,5 +742,4 @@ async def before_reconcile_league_roles() -> None:
 
 
 slash_commands_synced = False
-
 

@@ -8,6 +8,62 @@ from models import Customer, LeagueAttendance, LeagueSession
 
 class LeagueDatabaseService:
     @staticmethod
+    async def get_or_create_customer(
+        session: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        discord_user_id: int,
+        display_name: str,
+    ) -> Customer:
+        customer = (
+            await session.execute(
+                select(Customer).where(
+                    Customer.tenant_id == tenant_id,
+                    Customer.discord_user_id == str(discord_user_id),
+                )
+            )
+        ).scalar_one_or_none()
+
+        if customer is not None:
+            return customer
+
+        customer = Customer(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            display_name=display_name,
+            discord_user_id=str(discord_user_id),
+        )
+
+        session.add(customer)
+        await session.flush()
+
+        return customer
+
+    @staticmethod
+    async def get_active_session(
+        session: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        store_id: uuid.UUID,
+    ) -> LeagueSession:
+        league_session = (
+            await session.execute(
+                select(LeagueSession).where(
+                    LeagueSession.tenant_id == tenant_id,
+                    LeagueSession.store_id == store_id,
+                    LeagueSession.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+
+        if league_session is None:
+            raise ValueError(
+                "There is no active PostgreSQL League session."
+            )
+
+        return league_session
+
+    @staticmethod
     async def check_in_customer(
         session: AsyncSession,
         *,
@@ -31,7 +87,9 @@ class LeagueDatabaseService:
 
         customer = (
             await session.execute(
-                select(Customer).where(Customer.id == customer_id)
+                select(Customer).where(
+                    Customer.id == customer_id
+                )
             )
         ).scalar_one_or_none()
 
@@ -41,7 +99,8 @@ class LeagueDatabaseService:
         existing = (
             await session.execute(
                 select(LeagueAttendance).where(
-                    LeagueAttendance.league_session_id == league_session.id,
+                    LeagueAttendance.league_session_id
+                    == league_session.id,
                     LeagueAttendance.customer_id == customer.id,
                 )
             )
