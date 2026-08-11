@@ -54,6 +54,7 @@ services:
       - robincon_logs:/app/logs
       - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
       - ./migrations:/app/migrations:z
+      - ./scripts:/app/scripts:z
     healthcheck:
       test:
         [
