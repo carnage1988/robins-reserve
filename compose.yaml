@@ -6,18 +6,27 @@ services:
     image: robins-reserve:1.4.0-dev
     container_name: robins-reserve-robincon-dev
     restart: unless-stopped
-    env_file: [.env]
+    env_file:
+      - .env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - robincon_data:/app/data
       - robincon_logs:/app/logs
       - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('/app/logs/robins_reserve.log').exists() else 1)\""]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('/app/logs/robins_reserve.log').exists() else 1)\"",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-    security_opt: ["no-new-privileges:true"]
+    security_opt:
+      - no-new-privileges:true
 
   robins-api:
     build:
@@ -25,20 +34,40 @@ services:
       dockerfile: Dockerfile
     image: robins-reserve:1.4.0-dev
     container_name: robins-reserve-api-dev
-    command: ["uvicorn", "dashboard_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    command:
+      [
+        "uvicorn",
+        "dashboard_api:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
     restart: unless-stopped
-    env_file: [.env]
+    env_file:
+      - .env.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - robincon_data:/app/data
       - robincon_logs:/app/logs
       - ./secrets/google-service-account.json:/app/secrets/google-service-account.json:ro,z
+      - ./migrations:/app/migrations:z
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 45s
-    security_opt: ["no-new-privileges:true"]
+    security_opt:
+      - no-new-privileges:true
 
   robins-dashboard:
     build:
@@ -52,8 +81,32 @@ services:
         condition: service_healthy
     ports:
       - "10000:80"
-    security_opt: ["no-new-privileges:true"]
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:17
+    container_name: robinhub-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-robinhub_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-robinhub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-robinhub} -d ${POSTGRES_DB:-robinhub_dev}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   robincon_data:
   robincon_logs:
+  postgres_data:
