@@ -1408,12 +1408,17 @@ async def start_league(
                 created_by=staff_user.id,
             )
 
-            event = league_service.start_event()
+            try:
+                event = league_service.start_event()
+            except Exception:
+                await session.rollback()
+                raise
 
             await session.commit()
 
             event["postgresql_session_id"] = str(db_session.id)
             event["entry_fee"] = float(db_session.entry_fee)
+
             event["notification_warnings"] = _notify_league_started(
                 event,
                 _actor(staff),
@@ -1432,6 +1437,7 @@ async def start_league(
 
     except Exception as exc:
         logger.exception("Dashboard League start failed")
+
         raise HTTPException(
             status_code=500,
             detail=str(exc),
@@ -1468,11 +1474,16 @@ async def end_league(
                 store_id=store.id,
             )
 
-            event = league_service.close_active_event()
+            try:
+                event = league_service.close_active_event()
+            except Exception:
+                await session.rollback()
+                raise
 
             await session.commit()
 
             event["postgresql_session_id"] = str(db_session.id)
+
             event["notification_warnings"] = _notify_league_ended(
                 event,
                 _actor(staff),
@@ -1491,6 +1502,7 @@ async def end_league(
 
     except Exception as exc:
         logger.exception("Dashboard League end failed")
+
         raise HTTPException(
             status_code=500,
             detail=str(exc),
