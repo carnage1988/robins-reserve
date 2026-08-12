@@ -184,7 +184,6 @@ function leaguePage() {
     const dbSession = paymentData.session || null;
 
     const s = state.data.status || {};
-    const a = state.data.attendance || [];
     const e = s.active_event;
 
     const paymentRows = attendees.map((attendee) => {
@@ -283,7 +282,7 @@ function leaguePage() {
                 <small>
                     ${
                         e
-                            ? `${esc(s.attendance_count ?? attendees.length ?? a.length)} player(s) checked in`
+                            ? `${esc(attendees.length)} player(s) checked in`
                             : "Start an event to generate a store code"
                     }
                 </small>
@@ -296,7 +295,7 @@ function leaguePage() {
                             <article class="stat-card">
                                 <span class="stat-label">Attendance</span>
                                 <div class="stat-value">
-                                    ${esc(s.attendance_count ?? attendees.length ?? a.length)}
+                                    ${esc(attendees.length)}
                                 </div>
                             </article>
 
