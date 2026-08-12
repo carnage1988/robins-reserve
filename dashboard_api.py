@@ -498,6 +498,11 @@ def _notify_dashboard_decline(order: dict[str, Any], staff_name: str, reason: st
 class ActionRequest(BaseModel):
     reason: str = Field(default="", max_length=500)
 
+class LeagueManualCheckInRequest(BaseModel):
+    discord_user_id: str = Field(
+        min_length=1,
+        max_length=30,
+    )
 
 def _oauth_configured() -> bool:
     return all(
@@ -1180,6 +1185,41 @@ def league_attendance(event_id: str = "") -> list[dict[str, Any]]:
         )
     return results
 
+@app.get("/api/league/players")
+def league_players(
+    staff: dict[str, Any] = Depends(require_staff),
+) -> list[dict[str, Any]]:
+    """Return players who have linked their League Player ID."""
+
+    del staff
+
+    service, _ = require_services()
+
+    players: list[dict[str, Any]] = []
+
+    for row in service.league_players_sheet.get_all_records():
+        discord_user_id = _clean(row.get("Discord User ID"))
+
+        if not discord_user_id:
+            continue
+
+        players.append(
+            {
+                "discord_user_id": discord_user_id,
+                "discord_name": _clean(row.get("Discord Name")),
+                "player_id": _clean(row.get("Player ID")),
+                "last_attendance": _clean(row.get("Last Attendance")),
+            }
+        )
+
+    players.sort(
+        key=lambda player: (
+            player["discord_name"] or player["discord_user_id"]
+        ).casefold()
+    )
+
+    return players
+
 @app.get("/api/league/payments")
 async def league_payments(
     staff: dict[str, Any] = Depends(require_staff),
@@ -1506,6 +1546,148 @@ async def end_league(
         raise HTTPException(
             status_code=500,
             detail=str(exc),
+        ) from exc
+@app.post("/api/league/manual-checkin")
+async def manual_league_checkin(
+    payload: LeagueManualCheckInRequest,
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
+    service, league_service = require_services()
+
+    discord_user_id = payload.discord_user_id.strip()
+
+    if not discord_user_id.isdigit():
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid Discord user ID.",
+        )
+
+    try:
+        linked_player = league_service.get_linked_player(
+            int(discord_user_id)
+        )
+
+        if linked_player is None:
+            raise HTTPException(
+                status_code=404,
+                detail="That player has not linked a League Player ID.",
+            )
+
+        active_event = league_service.get_active_event()
+
+        if active_event is None:
+            raise HTTPException(
+                status_code=409,
+                detail="There is no active League event.",
+            )
+
+        store_code = _clean(
+            active_event.get("Store Code")
+        )
+
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            db_league_session = (
+                await LeagueDatabaseService.get_active_session(
+                    session,
+                    tenant_id=tenant.id,
+                    store_id=store.id,
+                )
+            )
+
+            display_name = (
+                _clean(linked_player.get("Discord Name"))
+                or f"Discord {discord_user_id}"
+            )
+
+            customer = (
+                await LeagueDatabaseService.get_or_create_customer(
+                    session,
+                    tenant_id=tenant.id,
+                    discord_user_id=int(discord_user_id),
+                    display_name=display_name,
+                )
+            )
+
+            attendance = (
+                await LeagueDatabaseService.check_in_customer(
+                    session,
+                    league_session_id=db_league_session.id,
+                    customer_id=customer.id,
+                    checkin_method="staff_dashboard",
+                )
+            )
+
+            payment = await PaymentService.create_cash_due(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+                customer_id=customer.id,
+                context_type="league_attendance",
+                context_id=attendance.id,
+                amount=db_league_session.entry_fee,
+                currency=db_league_session.currency,
+            )
+
+            # Keep the existing Sheets League workflow synchronised.
+            try:
+                sheet_result = league_service.check_in_player(
+                    discord_user_id=int(discord_user_id),
+                    store_code=store_code,
+                )
+            except Exception:
+                await session.rollback()
+                raise
+
+            await session.commit()
+
+            return {
+                "attendance_id": str(attendance.id),
+                "customer_id": str(customer.id),
+                "player_id": sheet_result["player_id"],
+                "discord_user_id": discord_user_id,
+                "display_name": display_name,
+                "payment_id": str(payment.id),
+                "payment_status": payment.status,
+                "amount": float(payment.amount),
+                "currency": payment.currency,
+                "checked_in": True,
+            }
+
+    except HTTPException:
+        raise
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Manual League check-in failed for Discord user %s",
+            discord_user_id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="The player could not be checked in.",
         ) from exc
 
 

@@ -127,17 +127,19 @@ async function loadPage() {
     } else if (state.page === "orders") state.data = {};
     else if (state.page === "products") state.data = { items: await api("/products") };
 else if (state.page === "league") {
-  const [status, attendance, payments] = await Promise.all([
-    api("/league/status"),
-    api("/league/attendance"),
-    api("/league/payments"),
-  ]);
+const [status, attendance, payments, players] = await Promise.all([
+  api("/league/status"),
+  api("/league/attendance"),
+  api("/league/payments"),
+  api("/league/players"),
+]);
 
-  state.data = {
-    status,
-    attendance,
-    payments,
-  };
+state.data = {
+  status,
+  attendance,
+  payments,
+  players,
+};
 }
     else if (state.page === "robincon") state.data = { summary: await api("/robincon/summary"), capacity: await api("/robincon/capacity"), tshirts: await api("/robincon/tshirts") };
     else if (state.page === "rc-orders") state.data = { items: await api("/robincon/orders") };
@@ -179,12 +181,49 @@ function productsPage() {
   return header("Products", "Preorder catalogue, pricing and stock") + error() + loading() + (rows.length ? `<div class="card-grid">${rows.map((r) => `<article class="data-card"><h3>${esc(r.product_name || r["Product Name"])}</h3><p><code>${esc(r.order_code || r["Order Code"])}</code></p><div class="product-facts"><strong>${esc(r.stock ?? r.Stock ?? 0)} in stock</strong><b>${money(r.unit_price)}</b></div></article>`).join("")}</div>` : empty("No products found."));
 }
 function leaguePage() {
+    const players = state.data.players || [];
     const paymentData = state.data.payments || {};
     const attendees = paymentData.attendees || [];
     const dbSession = paymentData.session || null;
 
     const s = state.data.status || {};
     const e = s.active_event;
+
+    const manualCheckin = e
+    ? `
+        <section class="panel league-manual-checkin">
+            <div class="panel-header">
+                <div>
+                    <h2 class="panel-title">Manual Check-In</h2>
+                    <div class="panel-subtitle">
+                        Check in a linked League player from the staff dashboard
+                    </div>
+                </div>
+            </div>
+
+            <form data-form="league-manual-checkin">
+                <select name="discord_user_id" required>
+                    <option value="">Select player…</option>
+
+                    ${players.map((player) => `
+                        <option value="${esc(player.discord_user_id)}">
+                            ${esc(
+                                player.discord_name ||
+                                player.player_id ||
+                                player.discord_user_id
+                            )}
+                            ${player.player_id ? `· ${esc(player.player_id)}` : ""}
+                        </option>
+                    `).join("")}
+                </select>
+
+                <button class="btn btn-primary">
+                    + Check In Player
+                </button>
+            </form>
+        </section>
+    `
+    : "";
 
     const paymentRows = attendees.map((attendee) => {
         const payment = attendee.payment;
@@ -287,6 +326,8 @@ function leaguePage() {
                     }
                 </small>
             </div>
+            
+            ${manualCheckin}
 
             ${
                 e
@@ -613,6 +654,28 @@ function bind() {
         toast("Ticket updated.");
         render();
       }
+      else if (kind === "league-manual-checkin") {
+    const discordUserId = String(
+        fd.get("discord_user_id") || ""
+    ).trim();
+
+    if (!discordUserId) {
+        throw new Error("Select a League player.");
+    }
+
+    await api(
+        "/league/manual-checkin",
+        {
+            method: "POST",
+            body: JSON.stringify({
+                discord_user_id: discordUserId,
+            }),
+        }
+    );
+
+    toast("Player checked in successfully.");
+    await loadPage();
+}
     } catch (e) {
       toast(e.message, "error");
     }
