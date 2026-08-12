@@ -19,6 +19,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 import requests
@@ -69,6 +70,10 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 DISCORD_REDIRECT_URI = os.getenv(
     "DISCORD_REDIRECT_URI",
     "http://localhost:10000/auth/discord/callback",
+).strip()
+LEAGUE_DISCORD_REDIRECT_URI = os.getenv(
+    "LEAGUE_DISCORD_REDIRECT_URI",
+    "http://localhost:10000/league/auth/discord/callback",
 ).strip()
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", os.getenv("LEAGUE_GUILD_ID", "")).strip()
 DISCORD_STAFF_ROLE_IDS = {
@@ -808,6 +813,175 @@ def discord_callback(request: Request, code: str = "", state: str = "") -> Redir
     }
     return RedirectResponse(FRONTEND_URL + "/")
 
+@app.get("/league/auth/discord/login")
+def league_discord_login(request: Request) -> RedirectResponse:
+    """Begin Discord OAuth for a League customer."""
+
+    if not all(
+        [
+            DISCORD_CLIENT_ID,
+            DISCORD_CLIENT_SECRET,
+            LEAGUE_DISCORD_REDIRECT_URI,
+            DISCORD_GUILD_ID,
+        ]
+    ):
+        return RedirectResponse(
+            "/league/checkin?error=Discord+login+is+not+configured"
+        )
+
+    oauth_state = secrets.token_urlsafe(32)
+
+    request.session["league_oauth_state"] = oauth_state
+
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": LEAGUE_DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds.members.read",
+        "state": oauth_state,
+    }
+
+    return RedirectResponse(
+        "https://discord.com/oauth2/authorize?"
+        + urlencode(params)
+    )
+
+
+@app.get("/league/auth/discord/callback")
+def league_discord_callback(
+    request: Request,
+    code: str = "",
+    state: str = "",
+) -> RedirectResponse:
+    """Complete Discord OAuth for a League customer."""
+
+    expected_state = request.session.pop(
+        "league_oauth_state",
+        None,
+    )
+
+    if (
+        not code
+        or not state
+        or state != expected_state
+    ):
+        return RedirectResponse(
+            "/league/checkin?error=Invalid+Discord+login+state"
+        )
+
+    try:
+        token_response = requests.post(
+            "https://discord.com/api/v10/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": LEAGUE_DISCORD_REDIRECT_URI,
+            },
+            headers={
+                "Content-Type":
+                    "application/x-www-form-urlencoded"
+            },
+            timeout=15,
+        )
+
+        token_response.raise_for_status()
+
+        access_token = token_response.json()[
+            "access_token"
+        ]
+
+        headers = {
+            "Authorization": f"Bearer {access_token}"
+        }
+
+        user_response = requests.get(
+            "https://discord.com/api/v10/users/@me",
+            headers=headers,
+            timeout=15,
+        )
+
+        user_response.raise_for_status()
+        user = user_response.json()
+
+        member_response = requests.get(
+            (
+                "https://discord.com/api/v10/users/@me/"
+                f"guilds/{DISCORD_GUILD_ID}/member"
+            ),
+            headers=headers,
+            timeout=15,
+        )
+
+        member_response.raise_for_status()
+        member = member_response.json()
+
+    except requests.HTTPError as exc:
+        response = exc.response
+
+        logger.error(
+            (
+                "League Discord OAuth HTTP error: "
+                "status=%s body=%s"
+            ),
+            (
+                response.status_code
+                if response is not None
+                else "unknown"
+            ),
+            (
+                response.text[:1000]
+                if response is not None
+                else str(exc)
+            ),
+        )
+
+        request.session.pop(
+            "league_user",
+            None,
+        )
+
+        return RedirectResponse(
+            "/league/checkin?error=Discord+login+failed"
+        )
+
+    except (
+        requests.RequestException,
+        KeyError,
+        ValueError,
+    ):
+        logger.exception(
+            "Unexpected League Discord OAuth error"
+        )
+
+        request.session.pop(
+            "league_user",
+            None,
+        )
+
+        return RedirectResponse(
+            "/league/checkin?error=Discord+login+failed"
+        )
+
+    request.session["league_user"] = {
+        "id": str(user.get("id", "")),
+        "username": user.get(
+            "username",
+            "Discord user",
+        ),
+        "display_name": (
+            member.get("nick")
+            or user.get("global_name")
+            or user.get("username")
+            or "Discord user"
+        ),
+        "avatar_url": _discord_avatar_url(user),
+    }
+
+    return RedirectResponse(
+        "/league/checkin"
+    )
 
 @app.get("/auth/me")
 def auth_me(request: Request) -> dict[str, Any]:
@@ -1149,6 +1323,416 @@ def _load_league_status() -> dict[str, Any]:
 def league_status() -> dict[str, Any]:
     return _cached_value("league_status", _load_league_status)
 
+@app.get("/league/checkin", response_class=HTMLResponse)
+async def public_league_checkin(
+    request: Request,
+) -> HTMLResponse:
+    """Public League check-in landing page."""
+
+    league_user = request.session.get("league_user")
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if tenant is None:
+                return HTMLResponse(
+                    content="<h1>League check-in unavailable</h1>",
+                    status_code=503,
+                )
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if store is None:
+                return HTMLResponse(
+                    content="<h1>League check-in unavailable</h1>",
+                    status_code=503,
+                )
+
+            league_session = (
+                await session.execute(
+                    select(LeagueSession).where(
+                        LeagueSession.tenant_id == tenant.id,
+                        LeagueSession.store_id == store.id,
+                        LeagueSession.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if league_session is None:
+                return HTMLResponse(
+                    content="""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Robins League Check-In</title>
+</head>
+<body>
+    <main>
+        <h1>Pokémon League</h1>
+        <h2>🔴 Check-in Closed</h2>
+
+        <p>
+            There is currently no active League session.
+        </p>
+
+        <p>
+            Please speak to a member of staff.
+        </p>
+    </main>
+</body>
+</html>
+                    """,
+                    status_code=200,
+                )
+
+            # League is active, but customer has not signed in yet.
+            if league_user is None:
+                return HTMLResponse(
+                    content=f"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Robins League Check-In</title>
+</head>
+<body>
+    <main>
+        <h1>Pokémon League</h1>
+        <h2>🟢 Check-in Open</h2>
+
+        <p>Robins Hobby Cafe — Belfast</p>
+
+        <p>
+            Entry fee:
+            <strong>£{league_session.entry_fee:.2f}</strong>
+        </p>
+
+        <a href="/league/auth/discord/login">
+            Continue with Discord
+        </a>
+    </main>
+</body>
+</html>
+                    """,
+                    status_code=200,
+                )
+
+            discord_user_id = str(
+                league_user.get("id", "")
+            ).strip()
+
+            display_name = (
+                league_user.get("display_name")
+                or league_user.get("username")
+                or "Discord user"
+            )
+
+            linked_player = None
+
+            if league is not None and discord_user_id.isdigit():
+                linked_player = league.get_linked_player(
+                    int(discord_user_id)
+                )
+
+            if linked_player is None:
+                return HTMLResponse(
+                    content=f"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Robins League Check-In</title>
+</head>
+<body>
+    <main>
+        <h1>Pokémon League</h1>
+        <h2>🟢 Check-in Open</h2>
+
+        <p>
+            Signed in as
+            <strong>{display_name}</strong>
+        </p>
+
+        <p>
+            Your Discord account does not currently
+            have a linked League Player ID.
+        </p>
+
+        <p>
+            Please link your Player ID in Discord
+            before checking in.
+        </p>
+    </main>
+</body>
+</html>
+                    """,
+                    status_code=200,
+                )
+
+            player_id = _clean(
+                linked_player.get("Player ID")
+            )
+
+            return HTMLResponse(
+                content=f"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Robins League Check-In</title>
+</head>
+<body>
+    <main>
+        <h1>Pokémon League</h1>
+        <h2>🟢 Check-in Open</h2>
+
+        <p>Robins Hobby Cafe — Belfast</p>
+
+        <p>
+            Entry fee:
+            <strong>£{league_session.entry_fee:.2f}</strong>
+        </p>
+
+        <hr>
+
+        <p>
+            Signed in as
+            <strong>{display_name}</strong>
+        </p>
+
+        <p>
+            Player ID:
+            <strong>{player_id}</strong>
+        </p>
+
+        <form
+            method="post"
+            action="/league/checkin"
+        >
+            <button type="submit">
+                Check In
+            </button>
+        </form>
+    </main>
+</body>
+</html>
+                """,
+                status_code=200,
+            )
+
+    except Exception:
+        logger.exception(
+            "Public League check-in page failed"
+        )
+
+        return HTMLResponse(
+            content="<h1>League check-in unavailable</h1>",
+            status_code=500,
+        )
+
+@app.post("/league/checkin", response_class=HTMLResponse)
+async def public_league_checkin_submit(
+    request: Request,
+) -> HTMLResponse:
+    """Check the signed-in League player into the active session."""
+
+    league_user = request.session.get("league_user")
+
+    if not league_user:
+        return RedirectResponse(
+            "/league/auth/discord/login",
+            status_code=303,
+        )
+
+    discord_user_id = str(
+        league_user.get("id", "")
+    ).strip()
+
+    display_name = (
+        league_user.get("display_name")
+        or league_user.get("username")
+        or "Discord user"
+    )
+
+    if not discord_user_id.isdigit():
+        return HTMLResponse(
+            content="<h1>Invalid Discord identity.</h1>",
+            status_code=400,
+        )
+
+    try:
+        linked_player = None
+
+        if league is not None:
+            linked_player = league.get_linked_player(
+                int(discord_user_id)
+            )
+
+        if linked_player is None:
+            return HTMLResponse(
+                content="""
+<h1>League check-in unavailable</h1>
+<p>Your Discord account does not have a linked League Player ID.</p>
+                """,
+                status_code=409,
+            )
+
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            league_session = (
+                await LeagueDatabaseService.get_active_session(
+                    session,
+                    tenant_id=tenant.id,
+                    store_id=store.id,
+                )
+            )
+
+            customer = (
+                await LeagueDatabaseService.get_or_create_customer(
+                    session,
+                    tenant_id=tenant.id,
+                    discord_user_id=int(discord_user_id),
+                    display_name=display_name,
+                )
+            )
+
+            attendance = (
+                await LeagueDatabaseService.check_in_customer(
+                    session,
+                    league_session_id=league_session.id,
+                    customer_id=customer.id,
+                    checkin_method="public_qr",
+                )
+            )
+
+            payment = await PaymentService.create_cash_due(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+                customer_id=customer.id,
+                context_type="league_attendance",
+                context_id=attendance.id,
+                amount=league_session.entry_fee,
+                currency=league_session.currency,
+            )
+
+            active_event = league.get_active_event()
+
+            if active_event is None:
+                await session.rollback()
+
+                return HTMLResponse(
+                    content="<h1>League check-in is closed.</h1>",
+                    status_code=409,
+                )
+
+            store_code = _clean(
+                active_event.get("Store Code")
+            )
+
+            try:
+                league.check_in_player(
+                    discord_user_id=int(discord_user_id),
+                    store_code=store_code,
+                )
+            except Exception:
+                await session.rollback()
+                raise
+
+            await session.commit()
+
+            return HTMLResponse(
+                content=f"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>League Check-In Complete</title>
+</head>
+<body>
+    <main>
+        <h1>✅ League Check-In Complete</h1>
+
+        <p>
+            Welcome,
+            <strong>{display_name}</strong>.
+        </p>
+
+        <p>
+            Entry fee:
+            <strong>£{payment.amount:.2f}</strong>
+        </p>
+
+        <p>
+            Payment:
+            <strong>Cash Due</strong>
+        </p>
+
+        <p>
+            Please pay at the counter.
+        </p>
+    </main>
+</body>
+</html>
+                """,
+                status_code=200,
+            )
+
+    except ValueError as exc:
+        return HTMLResponse(
+            content=f"""
+<h1>League check-in could not be completed.</h1>
+<p>{str(exc)}</p>
+            """,
+            status_code=409,
+        )
+
+    except Exception:
+        logger.exception(
+            "Public League check-in failed for Discord user %s",
+            discord_user_id,
+        )
+
+        return HTMLResponse(
+            content="<h1>League check-in failed. Please speak to staff.</h1>",
+            status_code=500,
+        )
 
 @app.get("/api/league/attendance")
 def league_attendance(event_id: str = "") -> list[dict[str, Any]]:
@@ -1268,6 +1852,60 @@ async def league_payments(
                     )
                 )
             ).scalar_one_or_none()
+
+            if tenant is None:
+                return HTMLResponse(
+                    content="<h1>League check-in unavailable</h1>",
+                    status_code=503,
+                )
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if store is None:
+                return HTMLResponse(
+                    content="<h1>League check-in unavailable</h1>",
+                    status_code=503,
+                )
+
+            league_session = (
+                await session.execute(
+                    select(LeagueSession).where(
+                        LeagueSession.tenant_id == tenant.id,
+                        LeagueSession.store_id == store.id,
+                        LeagueSession.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if league_session is None:
+                return HTMLResponse(
+                    content="""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Robins League Check-In</title>
+</head>
+<body>
+    <main>
+        <h1>Pokémon League</h1>
+        <h2>🔴 Check-in Closed</h2>
+        <p>There is currently no active League session.</p>
+        <p>Please speak to a member of staff.</p>
+    </main>
+</body>
+</html>
+                    """,
+                    status_code=200,
+                )
 
             if league_session is None:
                 return {
