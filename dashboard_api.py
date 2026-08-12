@@ -30,6 +30,24 @@ from services.robincon_service import RobinConService
 from services.robincon_staff_service import RobinConStaffService
 from services.dashboard_cache import DashboardCache
 
+import uuid
+
+from sqlalchemy import select
+
+from models import (
+    Customer,
+    LeagueAttendance,
+    LeagueSession,
+    LeagueTemplate,
+    Payment,
+    Store,
+    Tenant,
+    User,
+)
+from services.database import AsyncSessionLocal
+from services.payment_service import PaymentService
+from services.league_db_service import LeagueDatabaseService
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -505,6 +523,42 @@ def _actor(staff: dict[str, Any]) -> str:
     display = staff.get("display_name") or staff.get("username") or "Discord staff"
     return f"{display} (Discord ID: {staff.get('id', 'unknown')})"
 
+async def _resolve_db_staff_user(
+    session,
+    staff: dict[str, Any],
+) -> User:
+    discord_user_id = str(staff.get("id", "")).strip()
+
+    if not discord_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Discord staff identity is unavailable.",
+        )
+
+    user = (
+        await session.execute(
+            select(User).where(
+                User.discord_user_id == discord_user_id
+            )
+        )
+    ).scalar_one_or_none()
+
+    if user is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Your Discord account is not linked to a "
+                "RobinHub staff user."
+            ),
+        )
+
+    if not user.active:
+        raise HTTPException(
+            status_code=403,
+            detail="Your RobinHub staff account is inactive.",
+        )
+
+    return user
 
 def _discord_avatar_url(user: dict[str, Any]) -> str:
     avatar = user.get("avatar")
@@ -1126,34 +1180,456 @@ def league_attendance(event_id: str = "") -> list[dict[str, Any]]:
         )
     return results
 
+@app.get("/api/league/payments")
+async def league_payments(
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
+    """Return the active PostgreSQL League session and attendee payments."""
+
+    del staff
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if tenant is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="RobinHub tenant was not found.",
+                )
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if store is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="RobinHub store was not found.",
+                )
+
+            league_session = (
+                await session.execute(
+                    select(LeagueSession).where(
+                        LeagueSession.tenant_id == tenant.id,
+                        LeagueSession.store_id == store.id,
+                        LeagueSession.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if league_session is None:
+                return {
+                    "active": False,
+                    "session": None,
+                    "attendees": [],
+                }
+
+            league_template = (
+                await session.execute(
+                    select(LeagueTemplate).where(
+                        LeagueTemplate.id
+                        == league_session.league_template_id
+                    )
+                )
+            ).scalar_one_or_none()
+
+            attendance_rows = (
+                await session.execute(
+                    select(
+                        LeagueAttendance,
+                        Customer,
+                    )
+                    .join(
+                        Customer,
+                        Customer.id == LeagueAttendance.customer_id,
+                    )
+                    .where(
+                        LeagueAttendance.league_session_id
+                        == league_session.id
+                    )
+                    .order_by(
+                        LeagueAttendance.checked_in_at
+                    )
+                )
+            ).all()
+
+            attendance_ids = [
+                attendance.id
+                for attendance, _customer in attendance_rows
+            ]
+
+            payments_by_attendance: dict[uuid.UUID, Payment] = {}
+
+            if attendance_ids:
+                payments = (
+                    await session.execute(
+                        select(Payment)
+                        .where(
+                            Payment.context_type
+                            == "league_attendance",
+                            Payment.context_id.in_(attendance_ids),
+                        )
+                        .order_by(
+                            Payment.created_at.desc()
+                        )
+                    )
+                ).scalars().all()
+
+                # The newest payment for an attendance wins.
+                for payment in payments:
+                    if payment.context_id not in payments_by_attendance:
+                        payments_by_attendance[
+                            payment.context_id
+                        ] = payment
+
+            attendees: list[dict[str, Any]] = []
+
+            for attendance, customer in attendance_rows:
+                payment = payments_by_attendance.get(
+                    attendance.id
+                )
+
+                attendees.append(
+                    {
+                        "attendance_id": str(attendance.id),
+                        "customer_id": str(customer.id),
+                        "customer": customer.display_name,
+                        "discord_user_id": customer.discord_user_id,
+                        "checked_in_at": (
+                            attendance.checked_in_at.isoformat()
+                            if attendance.checked_in_at
+                            else None
+                        ),
+                        "attendance_status": attendance.status,
+                        "payment": (
+                            {
+                                "id": str(payment.id),
+                                "amount": float(payment.amount),
+                                "currency": payment.currency,
+                                "method": payment.method,
+                                "status": payment.status,
+                                "confirmed_by": (
+                                    str(payment.confirmed_by)
+                                    if payment.confirmed_by
+                                    else None
+                                ),
+                                "confirmed_at": (
+                                    payment.confirmed_at.isoformat()
+                                    if payment.confirmed_at
+                                    else None
+                                ),
+                            }
+                            if payment
+                            else None
+                        ),
+                    }
+                )
+
+            return {
+                "active": True,
+                "session": {
+                    "id": str(league_session.id),
+                    "name": (
+                        league_template.name
+                        if league_template
+                        else "League"
+                    ),
+                    "status": league_session.status,
+                    "entry_fee": float(
+                        league_session.entry_fee
+                    ),
+                    "currency": league_session.currency,
+                    "starts_at": league_session.starts_at.isoformat(),
+                    "ends_at": league_session.ends_at.isoformat(),
+                },
+                "attendees": attendees,
+            }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Could not load PostgreSQL League payments"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="League payment data could not be loaded.",
+        ) from exc
 
 @app.post("/api/league/start")
-def start_league(staff: dict[str, Any] = Depends(require_staff)) -> dict[str, Any]:
+async def start_league(
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
     _, league_service = require_services()
+
     try:
-        event = league_service.start_event()
-        event["notification_warnings"] = _notify_league_started(event, _actor(staff))
-        return event
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            staff_user = await _resolve_db_staff_user(
+                session,
+                staff,
+            )
+
+            db_session = await LeagueDatabaseService.start_session(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+                template_name="Pokémon Weekly League",
+                duration_hours=LEAGUE_EVENT_DURATION_HOURS,
+                created_by=staff_user.id,
+            )
+
+            event = league_service.start_event()
+
+            await session.commit()
+
+            event["postgresql_session_id"] = str(db_session.id)
+            event["entry_fee"] = float(db_session.entry_fee)
+            event["notification_warnings"] = _notify_league_started(
+                event,
+                _actor(staff),
+            )
+
+            return event
+
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
     except Exception as exc:
         logger.exception("Dashboard League start failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
 
 @app.post("/api/league/end")
-def end_league(staff: dict[str, Any] = Depends(require_staff)) -> dict[str, Any]:
+async def end_league(
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
     _, league_service = require_services()
+
     try:
-        event = league_service.close_active_event()
-        event["notification_warnings"] = _notify_league_ended(event, _actor(staff))
-        return event
+        async with AsyncSessionLocal() as session:
+            tenant = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.slug == "robins"
+                    )
+                )
+            ).scalar_one()
+
+            store = (
+                await session.execute(
+                    select(Store).where(
+                        Store.tenant_id == tenant.id,
+                        Store.code == "BELFAST",
+                    )
+                )
+            ).scalar_one()
+
+            db_session = await LeagueDatabaseService.end_active_session(
+                session,
+                tenant_id=tenant.id,
+                store_id=store.id,
+            )
+
+            event = league_service.close_active_event()
+
+            await session.commit()
+
+            event["postgresql_session_id"] = str(db_session.id)
+            event["notification_warnings"] = _notify_league_ended(
+                event,
+                _actor(staff),
+            )
+
+            return event
+
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
     except Exception as exc:
         logger.exception("Dashboard League end failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
 
+
+@app.post("/api/payments/{payment_id}/confirm-cash")
+async def confirm_cash_payment(
+    payment_id: uuid.UUID,
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
+    try:
+        async with AsyncSessionLocal() as session:
+            staff_user = await _resolve_db_staff_user(
+                session,
+                staff,
+            )
+
+            payment = await PaymentService.confirm_cash_payment(
+                session,
+                payment_id=payment_id,
+                confirmed_by=staff_user.id,
+            )
+
+            await session.commit()
+
+            return {
+                "id": str(payment.id),
+                "status": payment.status,
+                "method": payment.method,
+                "amount": float(payment.amount),
+                "currency": payment.currency,
+                "confirmed_by": str(payment.confirmed_by),
+                "confirmed_at": (
+                    payment.confirmed_at.isoformat()
+                    if payment.confirmed_at
+                    else None
+                ),
+                "paid_at": (
+                    payment.paid_at.isoformat()
+                    if payment.paid_at
+                    else None
+                ),
+            }
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Dashboard cash confirmation failed for payment %s",
+            payment_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Cash payment could not be confirmed.",
+        ) from exc
+
+@app.post("/api/payments/{payment_id}/comp")
+async def comp_payment(
+    payment_id: uuid.UUID,
+    request: ActionRequest,
+    staff: dict[str, Any] = Depends(require_staff),
+) -> dict[str, Any]:
+    reason = request.reason.strip()
+
+    if not reason:
+        raise HTTPException(
+            status_code=422,
+            detail="A comp reason is required.",
+        )
+
+    try:
+        async with AsyncSessionLocal() as session:
+            staff_user = await _resolve_db_staff_user(
+                session,
+                staff,
+            )
+
+            payment = await PaymentService.comp_payment(
+                session,
+                payment_id=payment_id,
+                confirmed_by=staff_user.id,
+                reason=reason,
+            )
+
+            await session.commit()
+
+            return {
+                "id": str(payment.id),
+                "status": payment.status,
+                "method": payment.method,
+                "amount": float(payment.amount),
+                "currency": payment.currency,
+                "confirmed_by": str(payment.confirmed_by),
+                "confirmed_at": (
+                    payment.confirmed_at.isoformat()
+                    if payment.confirmed_at
+                    else None
+                ),
+                "comp_reason": reason,
+            }
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=str(exc),
+        ) from exc
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Dashboard comp failed for payment %s",
+            payment_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Entry could not be comped.",
+        ) from exc
 # ---------------------------------------------------------------------------
 # RobinCon Operations Portal API
 # ---------------------------------------------------------------------------
