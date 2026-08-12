@@ -10,7 +10,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal, Callable, TypeVar
@@ -1313,6 +1313,227 @@ def products(
         ]
     return rows
 
+def _league_public_page(
+    *,
+    title: str,
+    heading: str,
+    body: str,
+    status_class: str = "",
+) -> str:
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b0d12">
+
+    <title>{title}</title>
+
+    <style>
+        * {{
+            box-sizing: border-box;
+        }}
+
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            font-family:
+                Inter,
+                system-ui,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+            background:
+                radial-gradient(circle at top, #222936 0%, #11151d 45%, #090b10 100%);
+            color: #f5f7fb;
+        }}
+
+        .league-shell {{
+            width: 100%;
+            max-width: 520px;
+        }}
+
+        .league-brand {{
+            text-align: center;
+            margin-bottom: 22px;
+        }}
+
+        .league-brand h1 {{
+            margin: 0;
+            font-size: 2rem;
+            letter-spacing: -0.04em;
+        }}
+
+        .league-brand p {{
+            margin: 8px 0 0;
+            color: #9da7b8;
+        }}
+
+        .league-card {{
+            background: rgba(20, 24, 33, 0.96);
+            border: 1px solid #303848;
+            border-radius: 20px;
+            padding: 28px;
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+        }}
+
+        .status {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            border-radius: 999px;
+            padding: 7px 12px;
+            margin-bottom: 18px;
+            font-size: 0.86rem;
+            font-weight: 700;
+        }}
+
+        .status.open {{
+            background: rgba(34, 197, 94, 0.12);
+            color: #86efac;
+            border: 1px solid rgba(34, 197, 94, 0.30);
+        }}
+
+        .status.closed {{
+            background: rgba(239, 68, 68, 0.12);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.30);
+        }}
+
+        .league-card h2 {{
+            margin: 0 0 12px;
+            font-size: 1.65rem;
+        }}
+
+        .league-card p {{
+            color: #b6bfce;
+            line-height: 1.55;
+        }}
+
+        .league-detail {{
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+            padding: 14px 0;
+            border-bottom: 1px solid #2c3442;
+        }}
+
+        .league-detail:last-of-type {{
+            border-bottom: 0;
+        }}
+
+        .league-detail span {{
+            color: #8f9aad;
+        }}
+
+        .league-detail strong {{
+            text-align: right;
+        }}
+
+        .league-code-label {{
+            display: block;
+            margin-top: 22px;
+            margin-bottom: 8px;
+            color: #b6bfce;
+            font-size: 0.92rem;
+            font-weight: 700;
+        }}
+
+        .league-code-input {{
+            width: 100%;
+            padding: 14px 16px;
+            border: 1px solid #3a4558;
+            border-radius: 12px;
+            background: #0f141d;
+            color: #f5f7fb;
+            font: inherit;
+            font-size: 1.1rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-align: center;
+            text-transform: uppercase;
+            outline: none;
+        }}
+
+        .league-code-input:focus {{
+            border-color: #5865f2;
+            box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.18);
+        }}
+
+        .league-action {{
+            display: block;
+            width: 100%;
+            margin-top: 24px;
+            padding: 14px 18px;
+            border: 0;
+            border-radius: 12px;
+            background: #5865f2;
+            color: white;
+            font-size: 1rem;
+            font-weight: 700;
+            text-align: center;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+
+        .league-action:hover {{
+            filter: brightness(1.08);
+        }}
+
+        .league-success {{
+            color: #86efac;
+        }}
+
+        .league-warning {{
+            color: #fcd34d;
+        }}
+
+        .league-footer {{
+            margin-top: 18px;
+            text-align: center;
+            color: #707b8d;
+            font-size: 0.82rem;
+        }}
+
+        @media (max-width: 520px) {{
+            body {{
+                padding: 16px;
+            }}
+
+            .league-card {{
+                padding: 22px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="league-shell">
+        <div class="league-brand">
+            <h1>Robins Hobby Cafe</h1>
+            <p>Pokémon League Check-In</p>
+        </div>
+
+        <main class="league-card">
+            <div class="status {status_class}">
+                {heading}
+            </div>
+
+            {body}
+        </main>
+
+        <div class="league-footer">
+            Powered by RobinHub
+        </div>
+    </div>
+</body>
+</html>
+"""
 
 def _load_league_status() -> dict[str, Any]:
     _, league_service = require_services()
@@ -1343,7 +1564,16 @@ async def public_league_checkin(
 
             if tenant is None:
                 return HTMLResponse(
-                    content="<h1>League check-in unavailable</h1>",
+                    content=_league_public_page(
+                        title="League Check-In Unavailable",
+                        heading="⚠️ Check-in Unavailable",
+                        status_class="closed",
+                        body="""
+                            <h2>Pokémon League</h2>
+                            <p>League check-in is currently unavailable.</p>
+                            <p>Please speak to a member of staff.</p>
+                        """,
+                    ),
                     status_code=503,
                 )
 
@@ -1358,7 +1588,16 @@ async def public_league_checkin(
 
             if store is None:
                 return HTMLResponse(
-                    content="<h1>League check-in unavailable</h1>",
+                    content=_league_public_page(
+                        title="League Check-In Unavailable",
+                        heading="⚠️ Check-in Unavailable",
+                        status_class="closed",
+                        body="""
+                            <h2>Pokémon League</h2>
+                            <p>League check-in is currently unavailable.</p>
+                            <p>Please speak to a member of staff.</p>
+                        """,
+                    ),
                     status_code=503,
                 )
 
@@ -1374,63 +1613,41 @@ async def public_league_checkin(
 
             if league_session is None:
                 return HTMLResponse(
-                    content="""
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Robins League Check-In</title>
-</head>
-<body>
-    <main>
-        <h1>Pokémon League</h1>
-        <h2>🔴 Check-in Closed</h2>
-
-        <p>
-            There is currently no active League session.
-        </p>
-
-        <p>
-            Please speak to a member of staff.
-        </p>
-    </main>
-</body>
-</html>
-                    """,
+                    content=_league_public_page(
+                        title="League Check-In Closed",
+                        heading="🔴 Check-in Closed",
+                        status_class="closed",
+                        body="""
+                            <h2>Pokémon League</h2>
+                            <p>There is currently no active League session.</p>
+                            <p>Please speak to a member of staff.</p>
+                        """,
+                    ),
                     status_code=200,
                 )
 
-            # League is active, but customer has not signed in yet.
             if league_user is None:
                 return HTMLResponse(
-                    content=f"""
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Robins League Check-In</title>
-</head>
-<body>
-    <main>
-        <h1>Pokémon League</h1>
-        <h2>🟢 Check-in Open</h2>
-
-        <p>Robins Hobby Cafe — Belfast</p>
-
-        <p>
-            Entry fee:
-            <strong>£{league_session.entry_fee:.2f}</strong>
-        </p>
-
-        <a href="/league/auth/discord/login">
-            Continue with Discord
-        </a>
-    </main>
-</body>
-</html>
-                    """,
+                    content=_league_public_page(
+                        title="Robins League Check-In",
+                        heading="🟢 Check-in Open",
+                        status_class="open",
+                        body=f"""
+                            <h2>Pokémon League</h2>
+                            <div class="league-detail">
+                                <span>Location</span>
+                                <strong>Robins Hobby Cafe — Belfast</strong>
+                            </div>
+                            <div class="league-detail">
+                                <span>Entry Fee</span>
+                                <strong>£{league_session.entry_fee:.2f}</strong>
+                            </div>
+                            <p>Sign in with Discord to continue with your League check-in.</p>
+                            <a class="league-action" href="/league/auth/discord/login">
+                                Continue with Discord
+                            </a>
+                        """,
+                    ),
                     status_code=200,
                 )
 
@@ -1453,37 +1670,20 @@ async def public_league_checkin(
 
             if linked_player is None:
                 return HTMLResponse(
-                    content=f"""
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Robins League Check-In</title>
-</head>
-<body>
-    <main>
-        <h1>Pokémon League</h1>
-        <h2>🟢 Check-in Open</h2>
-
-        <p>
-            Signed in as
-            <strong>{display_name}</strong>
-        </p>
-
-        <p>
-            Your Discord account does not currently
-            have a linked League Player ID.
-        </p>
-
-        <p>
-            Please link your Player ID in Discord
-            before checking in.
-        </p>
-    </main>
-</body>
-</html>
-                    """,
+                    content=_league_public_page(
+                        title="League Player ID Required",
+                        heading="⚠️ Player ID Required",
+                        status_class="closed",
+                        body=f"""
+                            <h2>Pokémon League</h2>
+                            <div class="league-detail">
+                                <span>Discord</span>
+                                <strong>{display_name}</strong>
+                            </div>
+                            <p>Your Discord account does not currently have a linked League Player ID.</p>
+                            <p>Please link your Player ID in Discord before checking in.</p>
+                        """,
+                    ),
                     status_code=200,
                 )
 
@@ -1492,50 +1692,48 @@ async def public_league_checkin(
             )
 
             return HTMLResponse(
-                content=f"""
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Robins League Check-In</title>
-</head>
-<body>
-    <main>
-        <h1>Pokémon League</h1>
-        <h2>🟢 Check-in Open</h2>
-
-        <p>Robins Hobby Cafe — Belfast</p>
-
-        <p>
-            Entry fee:
-            <strong>£{league_session.entry_fee:.2f}</strong>
-        </p>
-
-        <hr>
-
-        <p>
-            Signed in as
-            <strong>{display_name}</strong>
-        </p>
-
-        <p>
-            Player ID:
-            <strong>{player_id}</strong>
-        </p>
-
-        <form
-            method="post"
-            action="/league/checkin"
-        >
-            <button type="submit">
-                Check In
-            </button>
-        </form>
-    </main>
-</body>
-</html>
-                """,
+                content=_league_public_page(
+                    title="Robins League Check-In",
+                    heading="🟢 Check-in Open",
+                    status_class="open",
+                    body=f"""
+                        <h2>Ready to Check In</h2>
+                        <div class="league-detail">
+                            <span>Location</span>
+                            <strong>Robins Hobby Cafe — Belfast</strong>
+                        </div>
+                        <div class="league-detail">
+                            <span>Entry Fee</span>
+                            <strong>£{league_session.entry_fee:.2f}</strong>
+                        </div>
+                        <div class="league-detail">
+                            <span>Discord</span>
+                            <strong>{display_name}</strong>
+                        </div>
+                        <div class="league-detail">
+                            <span>Player ID</span>
+                            <strong>{player_id}</strong>
+                        </div>
+                        <form method="post" action="/league/checkin">
+                            <label class="league-code-label" for="store_code">
+                                Current League Store Code
+                            </label>
+                            <input
+                                class="league-code-input"
+                                id="store_code"
+                                name="store_code"
+                                type="text"
+                                maxlength="12"
+                                autocomplete="off"
+                                autocapitalize="characters"
+                                spellcheck="false"
+                                placeholder="Enter code"
+                                required
+                            >
+                            <button class="league-action" type="submit">Check In</button>
+                        </form>
+                    """,
+                ),
                 status_code=200,
             )
 
@@ -1545,9 +1743,19 @@ async def public_league_checkin(
         )
 
         return HTMLResponse(
-            content="<h1>League check-in unavailable</h1>",
+            content=_league_public_page(
+                title="League Check-In Unavailable",
+                heading="⚠️ Check-in Unavailable",
+                status_class="closed",
+                body="""
+                    <h2>Something went wrong</h2>
+                    <p>League check-in is temporarily unavailable.</p>
+                    <p>Please speak to a member of staff.</p>
+                """,
+            ),
             status_code=500,
         )
+
 
 @app.post("/league/checkin", response_class=HTMLResponse)
 async def public_league_checkin_submit(
@@ -1573,9 +1781,23 @@ async def public_league_checkin_submit(
         or "Discord user"
     )
 
+    raw_body = (await request.body()).decode("utf-8", errors="replace")
+    submitted_store_code = _clean(
+        parse_qs(raw_body).get("store_code", [""])[0]
+    ).upper()
+
     if not discord_user_id.isdigit():
         return HTMLResponse(
-            content="<h1>Invalid Discord identity.</h1>",
+            content=_league_public_page(
+                title="League Check-In Unavailable",
+                heading="⚠️ Check-in Unavailable",
+                status_class="closed",
+                body="""
+                    <h2>Invalid Discord Identity</h2>
+                    <p>We could not identify your Discord account.</p>
+                    <p>Please speak to a member of staff.</p>
+                """,
+            ),
             status_code=400,
         )
 
@@ -1589,10 +1811,64 @@ async def public_league_checkin_submit(
 
         if linked_player is None:
             return HTMLResponse(
-                content="""
-<h1>League check-in unavailable</h1>
-<p>Your Discord account does not have a linked League Player ID.</p>
-                """,
+                content=_league_public_page(
+                    title="League Player ID Required",
+                    heading="⚠️ Player ID Required",
+                    status_class="closed",
+                    body=f"""
+                        <h2>Pokémon League</h2>
+                        <div class="league-detail">
+                            <span>Discord</span>
+                            <strong>{display_name}</strong>
+                        </div>
+                        <p>Your Discord account does not have a linked League Player ID.</p>
+                        <p>Please link your Player ID in Discord before checking in.</p>
+                    """,
+                ),
+                status_code=409,
+            )
+
+        active_event = league.get_active_event() if league is not None else None
+
+        if active_event is None:
+            return HTMLResponse(
+                content=_league_public_page(
+                    title="League Check-In Closed",
+                    heading="🔴 Check-in Closed",
+                    status_class="closed",
+                    body="""
+                        <h2>Pokémon League</h2>
+                        <p>The active League event has closed.</p>
+                        <p>Please speak to a member of staff.</p>
+                    """,
+                ),
+                status_code=409,
+            )
+
+        active_store_code = _clean(
+            active_event.get("Store Code")
+        ).upper()
+
+        if not submitted_store_code or not secrets.compare_digest(
+            submitted_store_code,
+            active_store_code,
+        ):
+            return HTMLResponse(
+                content=_league_public_page(
+                    title="Invalid League Store Code",
+                    heading="⚠️ Invalid Store Code",
+                    status_class="closed",
+                    body=f"""
+                        <h2>Pokémon League</h2>
+                        <div class="league-detail">
+                            <span>Player</span>
+                            <strong>{display_name}</strong>
+                        </div>
+                        <p>That Store Code does not match the current League event.</p>
+                        <p>Please enter the code displayed in store and try again.</p>
+                        <a class="league-action" href="/league/checkin">Try Again</a>
+                    """,
+                ),
                 status_code=409,
             )
 
@@ -1651,24 +1927,10 @@ async def public_league_checkin_submit(
                 currency=league_session.currency,
             )
 
-            active_event = league.get_active_event()
-
-            if active_event is None:
-                await session.rollback()
-
-                return HTMLResponse(
-                    content="<h1>League check-in is closed.</h1>",
-                    status_code=409,
-                )
-
-            store_code = _clean(
-                active_event.get("Store Code")
-            )
-
             try:
                 league.check_in_player(
                     discord_user_id=int(discord_user_id),
-                    store_code=store_code,
+                    store_code=active_store_code,
                 )
             except Exception:
                 await session.rollback()
@@ -1677,49 +1939,41 @@ async def public_league_checkin_submit(
             await session.commit()
 
             return HTMLResponse(
-                content=f"""
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>League Check-In Complete</title>
-</head>
-<body>
-    <main>
-        <h1>✅ League Check-In Complete</h1>
-
-        <p>
-            Welcome,
-            <strong>{display_name}</strong>.
-        </p>
-
-        <p>
-            Entry fee:
-            <strong>£{payment.amount:.2f}</strong>
-        </p>
-
-        <p>
-            Payment:
-            <strong>Cash Due</strong>
-        </p>
-
-        <p>
-            Please pay at the counter.
-        </p>
-    </main>
-</body>
-</html>
-                """,
+                content=_league_public_page(
+                    title="League Check-In Complete",
+                    heading="✅ Check-In Complete",
+                    status_class="open",
+                    body=f"""
+                        <h2 class="league-success">You're checked in!</h2>
+                        <div class="league-detail">
+                            <span>Player</span>
+                            <strong>{display_name}</strong>
+                        </div>
+                        <div class="league-detail">
+                            <span>Entry Fee</span>
+                            <strong>£{payment.amount:.2f}</strong>
+                        </div>
+                        <div class="league-detail">
+                            <span>Payment</span>
+                            <strong>Cash Due</strong>
+                        </div>
+                        <p>Please pay at the counter.</p>
+                    """,
+                ),
                 status_code=200,
             )
 
     except ValueError as exc:
         return HTMLResponse(
-            content=f"""
-<h1>League check-in could not be completed.</h1>
-<p>{str(exc)}</p>
-            """,
+            content=_league_public_page(
+                title="League Check-In",
+                heading="⚠️ Check-In Not Completed",
+                status_class="closed",
+                body=f"""
+                    <h2>Unable to Check In</h2>
+                    <p>{str(exc)}</p>
+                """,
+            ),
             status_code=409,
         )
 
@@ -1730,7 +1984,16 @@ async def public_league_checkin_submit(
         )
 
         return HTMLResponse(
-            content="<h1>League check-in failed. Please speak to staff.</h1>",
+            content=_league_public_page(
+                title="League Check-In Failed",
+                heading="⚠️ Check-In Failed",
+                status_class="closed",
+                body="""
+                    <h2>Something went wrong</h2>
+                    <p>We could not complete your League check-in.</p>
+                    <p>Please speak to a member of staff.</p>
+                """,
+            ),
             status_code=500,
         )
 
