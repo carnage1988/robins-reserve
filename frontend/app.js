@@ -4,8 +4,22 @@ const API_BASE = String(CONFIG.API_BASE_URL || "").replace(/\/+$/, "");
 const API = `${API_BASE}/api`;
 const AUTH = `${API_BASE}/auth`;
 const ENVIRONMENT = String(CONFIG.ENVIRONMENT || "Development");
-const state = { authChecked: false, authenticated: false, user: null, page: "home", loading: false, error: "", data: {}, selected: null, mobileNav: false, sidebarCollapsed: false, lookup: null, lookupTimer: null };
-const navGroups = [
+const state = {
+  authChecked: false,
+  authenticated: false,
+  user: null,
+  page: "home",
+  loading: false,
+  error: "",
+  data: {},
+  selected: null,
+  mobileNav: false,
+  sidebarCollapsed: false,
+  lookup: null,
+  lookupTimer: null,
+  autoRefreshTimer: null,
+};
+  const navGroups = [
   ["Operations", [["home", "⌂", "Dashboard"], ["orders", "⌕", "Orders"], ["products", "▦", "Products"]]],
   ["Community", [["league", "♟", "Pokémon League"]]],
   ["Events", [["robincon", "🎟", "RobinCon"], ["rc-orders", "≡", "RobinCon Orders"], ["rc-tickets", "◎", "RobinCon Tickets"], ["checkin", "✓", "Check-In"]]]
@@ -115,42 +129,105 @@ function activityRows(rows) {
   if (!rows?.length) return empty("No recent activity.", "↻");
   return `<div class="activity-list">${rows.map((r) => `<div class="activity"><span class="activity-dot ${String(r.status).toLowerCase() === "approved" ? "online" : ""}"></span><div class="activity-main"><div class="activity-title">${esc(r.discord_username || "Customer")} · ${esc(r.pickup_pin)}</div><div class="activity-meta">${esc(r.status)} · ${esc(r.total_items)} item(s) · ${money(r.total_value)}</div></div></div>`).join("")}</div>`;
 }
-async function loadPage() {
-  state.loading = true;
-  state.error = "";
-  render();
+async function loadPage(silent = false) {
+  if (!silent) {
+    state.loading = true;
+    state.error = "";
+    render();
+  }
+
   try {
     if (state.page === "home") {
-      const [dashResult, healthResult] = await Promise.allSettled([api("/dashboard"), api("/service-health")]);
-      state.data = { dash: dashResult.status === "fulfilled" ? dashResult.value : {}, health: healthResult.status === "fulfilled" ? healthResult.value : { api: { connected: true, message: "Connected" } } };
-      if (dashResult.status === "rejected") state.error = dashResult.reason.message;
-    } else if (state.page === "orders") state.data = {};
-    else if (state.page === "products") state.data = { items: await api("/products") };
-else if (state.page === "league") {
-const [status, attendance, payments, players] = await Promise.all([
-  api("/league/status"),
-  api("/league/attendance"),
-  api("/league/payments"),
-  api("/league/players"),
-]);
+      const [dashResult, healthResult] = await Promise.allSettled([
+        api("/dashboard"),
+        api("/service-health"),
+      ]);
 
-state.data = {
-  status,
-  attendance,
-  payments,
-  players,
-};
-}
-    else if (state.page === "robincon") state.data = { summary: await api("/robincon/summary"), capacity: await api("/robincon/capacity"), tshirts: await api("/robincon/tshirts") };
-    else if (state.page === "rc-orders") state.data = { items: await api("/robincon/orders") };
-    else if (state.page === "rc-tickets") state.data = { items: await api("/robincon/tickets") };
-    else if (state.page === "checkin") state.data = {};
+      state.data = {
+        dash: dashResult.status === "fulfilled" ? dashResult.value : {},
+        health:
+          healthResult.status === "fulfilled"
+            ? healthResult.value
+            : {
+                api: {
+                  connected: true,
+                  message: "Connected",
+                },
+              },
+      };
+
+      if (dashResult.status === "rejected") {
+        state.error = dashResult.reason.message;
+      }
+    } else if (state.page === "orders") {
+      state.data = {};
+    } else if (state.page === "products") {
+      state.data = {
+        items: await api("/products"),
+      };
+    } else if (state.page === "league") {
+      const [status, attendance, payments, players] = await Promise.all([
+        api("/league/status"),
+        api("/league/attendance"),
+        api("/league/payments"),
+        api("/league/players"),
+      ]);
+
+      state.data = {
+        status,
+        attendance,
+        payments,
+        players,
+      };
+    } else if (state.page === "robincon") {
+      state.data = {
+        summary: await api("/robincon/summary"),
+        capacity: await api("/robincon/capacity"),
+        tshirts: await api("/robincon/tshirts"),
+      };
+    } else if (state.page === "rc-orders") {
+      state.data = {
+        items: await api("/robincon/orders"),
+      };
+    } else if (state.page === "rc-tickets") {
+      state.data = {
+        items: await api("/robincon/tickets"),
+      };
+    } else if (state.page === "checkin") {
+      state.data = {};
+    }
   } catch (e) {
     state.error = e.message;
   }
-  state.loading = false;
+
+  if (!silent) {
+    state.loading = false;
+  }
+
   render();
 }
+
+function startAutoRefresh() {
+  clearInterval(state.autoRefreshTimer);
+
+  state.autoRefreshTimer = setInterval(async () => {
+    if (!state.authenticated) return;
+    if (document.hidden) return;
+    if (state.loading) return;
+
+    await loadPage(true);
+  }, 15000);
+}
+
+document.addEventListener("visibilitychange", async () => {
+  if (
+    !document.hidden &&
+    state.authenticated &&
+    !state.loading
+  ) {
+    await loadPage();
+  }
+});
 function homePage() {
   const d = state.data.dash || {}, h = state.data.health || {}, l = d.league || {}, pending = d.pending_orders || [];
   const all = Object.values(h).every((x) => x?.connected !== false);
@@ -689,7 +766,12 @@ function bind() {
   } catch {
     state.authenticated = false;
   }
+
   state.authChecked = true;
   render();
-  if (state.authenticated) loadPage();
+
+  if (state.authenticated) {
+    await loadPage();
+    startAutoRefresh();
+  }
 })();

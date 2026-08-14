@@ -46,12 +46,51 @@ class LeagueDatabaseService:
         return customer
 
     @staticmethod
+    async def _expire_stale_sessions(
+        session: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        store_id: uuid.UUID,
+    ) -> int:
+        """
+        Close any PostgreSQL League sessions that are still marked active
+        even though their configured end time has passed.
+        """
+
+        now = datetime.now(timezone.utc)
+
+        stale_sessions = (
+            await session.execute(
+                select(LeagueSession).where(
+                    LeagueSession.tenant_id == tenant_id,
+                    LeagueSession.store_id == store_id,
+                    LeagueSession.status == "active",
+                    LeagueSession.ends_at <= now,
+                )
+            )
+        ).scalars().all()
+
+        for league_session in stale_sessions:
+            league_session.status = "closed"
+
+        if stale_sessions:
+            await session.flush()
+
+        return len(stale_sessions)
+
+    @staticmethod
     async def get_active_session(
         session: AsyncSession,
         *,
         tenant_id: uuid.UUID,
         store_id: uuid.UUID,
     ) -> LeagueSession:
+        await LeagueDatabaseService._expire_stale_sessions(
+            session,
+            tenant_id=tenant_id,
+            store_id=store_id,
+        )
+
         league_session = (
             await session.execute(
                 select(LeagueSession).where(
@@ -79,6 +118,12 @@ class LeagueDatabaseService:
         duration_hours: int,
         created_by: uuid.UUID | None = None,
     ) -> LeagueSession:
+        await LeagueDatabaseService._expire_stale_sessions(
+            session,
+            tenant_id=tenant_id,
+            store_id=store_id,
+        )
+
         existing = (
             await session.execute(
                 select(LeagueSession).where(
@@ -136,6 +181,12 @@ class LeagueDatabaseService:
         tenant_id: uuid.UUID,
         store_id: uuid.UUID,
     ) -> LeagueSession:
+        await LeagueDatabaseService._expire_stale_sessions(
+            session,
+            tenant_id=tenant_id,
+            store_id=store_id,
+        )
+
         league_session = (
             await session.execute(
                 select(LeagueSession).where(
@@ -177,7 +228,19 @@ class LeagueDatabaseService:
         if league_session is None:
             raise ValueError("League session not found.")
 
-        if league_session.status != "active":
+        now = datetime.now(timezone.utc)
+
+        if (
+            league_session.status != "active"
+            or league_session.ends_at <= now
+        ):
+            if (
+                league_session.status == "active"
+                and league_session.ends_at <= now
+            ):
+                league_session.status = "closed"
+                await session.flush()
+
             raise ValueError("League session is not active.")
 
         customer = (
