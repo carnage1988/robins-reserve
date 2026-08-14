@@ -29,3 +29,4 @@ itsdangerous==2.2.0
 SQLAlchemy==2.0.51
 alembic==1.19.1
 psycopg[binary]==3.3.4
+qrcode[pil]==8.2

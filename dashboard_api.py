@@ -9,7 +9,11 @@ from __future__ import annotations
 import os
 import secrets
 import time
+import io
 from pathlib import Path
+
+import qrcode
+from PIL import Image
 from urllib.parse import urlencode, parse_qs
 from collections import defaultdict
 from datetime import datetime
@@ -18,8 +22,7 @@ from typing import Any, Literal, Callable, TypeVar
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 import requests
@@ -1543,6 +1546,79 @@ def _load_league_status() -> dict[str, Any]:
 @app.get("/api/league/status")
 def league_status() -> dict[str, Any]:
     return _cached_value("league_status", _load_league_status)
+
+@app.get("/api/league/checkin-qr")
+def league_checkin_qr() -> Response:
+    """Generate the permanent Robins League check-in QR."""
+
+    checkin_url = f"{FRONTEND_URL}/league/checkin"
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=4,
+    )
+
+    qr.add_data(checkin_url)
+    qr.make(fit=True)
+
+    qr_image = qr.make_image(
+        fill_color="black",
+        back_color="white",
+    ).convert("RGB")
+
+    logo_path = Path("/app/assets/robins-logo.png")
+
+    if logo_path.exists():
+        logo = Image.open(logo_path).convert("RGBA")
+
+        # Keep the logo small enough to preserve QR reliability.
+        max_logo_size = int(qr_image.width * 0.18)
+
+        logo.thumbnail(
+            (max_logo_size, max_logo_size),
+            Image.Resampling.LANCZOS,
+        )
+
+        # Create a white padded area behind the logo.
+        padding = 10
+
+        logo_background = Image.new(
+            "RGBA",
+            (
+                logo.width + padding * 2,
+                logo.height + padding * 2,
+            ),
+            "white",
+        )
+
+        logo_background.paste(
+            logo,
+            (padding, padding),
+            logo,
+        )
+
+        position = (
+            (qr_image.width - logo_background.width) // 2,
+            (qr_image.height - logo_background.height) // 2,
+        )
+
+        qr_image.paste(
+            logo_background.convert("RGB"),
+            position,
+        )
+
+    buffer = io.BytesIO()
+    qr_image.save(buffer, format="PNG")
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 @app.get("/league/checkin", response_class=HTMLResponse)
 async def public_league_checkin(

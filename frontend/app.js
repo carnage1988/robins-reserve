@@ -258,215 +258,464 @@ function productsPage() {
   return header("Products", "Preorder catalogue, pricing and stock") + error() + loading() + (rows.length ? `<div class="card-grid">${rows.map((r) => `<article class="data-card"><h3>${esc(r.product_name || r["Product Name"])}</h3><p><code>${esc(r.order_code || r["Order Code"])}</code></p><div class="product-facts"><strong>${esc(r.stock ?? r.Stock ?? 0)} in stock</strong><b>${money(r.unit_price)}</b></div></article>`).join("")}</div>` : empty("No products found."));
 }
 function leaguePage() {
-    const players = state.data.players || [];
-    const paymentData = state.data.payments || {};
-    const attendees = paymentData.attendees || [];
-    const dbSession = paymentData.session || null;
+  const players = state.data.players || [];
+  const paymentData = state.data.payments || {};
+  const attendees = paymentData.attendees || [];
+  const dbSession = paymentData.session || null;
 
-    const s = state.data.status || {};
-    const e = s.active_event;
+  const s = state.data.status || {};
+  const e = s.active_event;
 
-    const manualCheckin = e
+  const qrPanel = `
+    <section class="panel league-qr-panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">League Check-In QR</h2>
+          <div class="panel-subtitle">
+            Permanent QR for customer Pokémon League check-in
+          </div>
+        </div>
+      </div>
+
+      <div style="
+        display: flex;
+        gap: 28px;
+        align-items: center;
+        flex-wrap: wrap;
+      ">
+        <div style="
+          background: white;
+          padding: 14px;
+          border-radius: 16px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        ">
+          <img
+            src="${API}/league/checkin-qr"
+            alt="Pokémon League Check-In QR"
+            style="
+              width: 220px;
+              height: 220px;
+              display: block;
+            "
+          >
+        </div>
+
+        <div style="
+          flex: 1;
+          min-width: 240px;
+        ">
+          <p style="margin-top: 0;">
+            Players scan this QR, sign in with Discord and enter the
+            current Store Code displayed in store.
+          </p>
+
+          <p>
+            <strong>This QR is permanent.</strong>
+            You do not need to regenerate it for each League night.
+          </p>
+
+          ${
+            e
+              ? `
+                <div style="margin: 20px 0;">
+                  <span class="stat-label">Current Store Code</span>
+                  <div class="stat-value mono">
+                    ${esc(e["Store Code"] || "—")}
+                  </div>
+                </div>
+              `
+              : `
+                <p>
+                  Start a League event to generate the current Store Code.
+                </p>
+              `
+          }
+
+          <button
+            class="btn btn-primary"
+            data-action="print-league-qr"
+          >
+            🖨 Print Check-In Poster
+          </button>
+        </div>
+      </div>
+    </section>
+  `;
+
+  const manualCheckin = e
     ? `
         <section class="panel league-manual-checkin">
-            <div class="panel-header">
-                <div>
-                    <h2 class="panel-title">Manual Check-In</h2>
-                    <div class="panel-subtitle">
-                        Check in a linked League player from the staff dashboard
-                    </div>
-                </div>
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Manual Check-In</h2>
+              <div class="panel-subtitle">
+                Check in a linked League player from the staff dashboard
+              </div>
             </div>
+          </div>
 
-            <form data-form="league-manual-checkin">
-                <select name="discord_user_id" required>
-                    <option value="">Select player…</option>
+          <form data-form="league-manual-checkin">
+            <select name="discord_user_id" required>
+              <option value="">Select player…</option>
 
-                    ${players.map((player) => `
-                        <option value="${esc(player.discord_user_id)}">
-                            ${esc(
-                                player.discord_name ||
-                                player.player_id ||
-                                player.discord_user_id
-                            )}
-                            ${player.player_id ? `· ${esc(player.player_id)}` : ""}
-                        </option>
-                    `).join("")}
-                </select>
+              ${players.map((player) => `
+                <option value="${esc(player.discord_user_id)}">
+                  ${esc(
+                    player.discord_name ||
+                    player.player_id ||
+                    player.discord_user_id
+                  )}
+                  ${player.player_id ? `· ${esc(player.player_id)}` : ""}
+                </option>
+              `).join("")}
+            </select>
 
-                <button class="btn btn-primary">
-                    + Check In Player
-                </button>
-            </form>
+            <button class="btn btn-primary">
+              + Check In Player
+            </button>
+          </form>
         </section>
-    `
+      `
     : "";
 
-    const paymentRows = attendees.map((attendee) => {
-        const payment = attendee.payment;
+  const paymentRows = attendees.map((attendee) => {
+    const payment = attendee.payment;
 
-        let paymentText = "No payment";
-        let paymentClass = "status-default";
-        let actions = "—";
+    let paymentText = "No payment";
+    let paymentClass = "status-default";
+    let actions = "—";
 
-        if (payment) {
-            if (payment.status === "cash_due") {
-                paymentText = `💷 Cash Due · ${money(payment.amount)}`;
-                paymentClass = "status-pending";
+    if (payment) {
+      if (payment.status === "cash_due") {
+        paymentText = `💷 Cash Due · ${money(payment.amount)}`;
+        paymentClass = "status-pending";
 
-                actions = `
-                    <div class="record-actions">
-                        <button
-                            class="btn btn-success"
-                            data-action="league-cash-paid"
-                            data-payment-id="${esc(payment.id)}"
-                        >
-                            💷 Mark Cash Paid
-                        </button>
+        actions = `
+          <div class="record-actions">
+            <button
+              class="btn btn-success"
+              data-action="league-cash-paid"
+              data-payment-id="${esc(payment.id)}"
+            >
+              💷 Mark Cash Paid
+            </button>
 
-                        <button
-                            class="btn btn-ghost"
-                            data-action="league-comp"
-                            data-payment-id="${esc(payment.id)}"
-                            data-customer="${esc(attendee.customer || "Player")}"
-                        >
-                            🎟 Comp Entry
-                        </button>
-                    </div>
-                `;
-            } else if (payment.status === "paid") {
-                paymentText = `✓ Paid · ${money(payment.amount)}`;
-                paymentClass = "status-approved";
-            } else if (payment.status === "comped") {
-                paymentText = `🎟 Comped · ${money(payment.amount)}`;
-                paymentClass = "status-approved";
-            } else {
-                paymentText = `${payment.status} · ${money(payment.amount)}`;
-            }
+            <button
+              class="btn btn-ghost"
+              data-action="league-comp"
+              data-payment-id="${esc(payment.id)}"
+              data-customer="${esc(attendee.customer || "Player")}"
+            >
+              🎟 Comp Entry
+            </button>
+          </div>
+        `;
+      } else if (payment.status === "paid") {
+        paymentText = `✓ Paid · ${money(payment.amount)}`;
+        paymentClass = "status-approved";
+      } else if (payment.status === "comped") {
+        paymentText = `🎟 Comped · ${money(payment.amount)}`;
+        paymentClass = "status-approved";
+      } else {
+        paymentText = `${payment.status} · ${money(payment.amount)}`;
+      }
+    }
+
+    return `
+      <tr>
+        <td>
+          <strong>
+            ${esc(attendee.customer || attendee.discord_user_id || "Unknown")}
+          </strong>
+        </td>
+
+        <td>
+          ${esc(formatDateTime(attendee.checked_in_at))}
+        </td>
+
+        <td>
+          <span class="status-pill ${paymentClass}">
+            ${paymentText}
+          </span>
+        </td>
+
+        <td>
+          ${actions}
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  return (
+    header(
+      "Pokémon League",
+      "Current event, attendance and payments",
+      `
+        <button
+          class="btn ${e ? "btn-danger" : "btn-success"}"
+          data-action="${e ? "end-league" : "start-league"}"
+        >
+          ${e ? "End Event" : "Start Event"}
+        </button>
+      `
+    )
+    + error()
+    + loading()
+    + `
+      <div class="league-status-card ${e ? "running" : "inactive"}">
+        <span>
+          ${e ? "Running" : "Not Running"}
+        </span>
+
+        <strong>
+          ${e ? esc(e["Store Code"] || "—") : "No active event"}
+        </strong>
+
+        <small>
+          ${
+            e
+              ? `${esc(attendees.length)} player(s) checked in`
+              : "Start an event to generate a store code"
+          }
+        </small>
+      </div>
+
+      ${qrPanel}
+
+      ${manualCheckin}
+
+      ${
+        e
+          ? `
+              <div class="stats-grid">
+                <article class="stat-card">
+                  <span class="stat-label">Attendance</span>
+                  <div class="stat-value">
+                    ${esc(attendees.length)}
+                  </div>
+                </article>
+
+                <article class="stat-card">
+                  <span class="stat-label">Store Code</span>
+                  <div class="stat-value mono">
+                    ${esc(e["Store Code"] || "—")}
+                  </div>
+                </article>
+
+                <article class="stat-card">
+                  <span class="stat-label">Entry Fee</span>
+                  <div class="stat-value">
+                    ${dbSession ? money(dbSession.entry_fee) : "—"}
+                  </div>
+                </article>
+
+                <article class="stat-card">
+                  <span class="stat-label">Ends</span>
+                  <div class="stat-value small-value">
+                    ${esc(formatDateTime(dbSession?.ends_at || e["End Time"]))}
+                  </div>
+                </article>
+              </div>
+            `
+          : ""
+      }
+
+      ${
+        attendees.length
+          ? `
+              <div class="table-card league-payments-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Player</th>
+                      <th>Checked In</th>
+                      <th>Payment</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    ${paymentRows}
+                  </tbody>
+                </table>
+              </div>
+            `
+          : empty("No attendance records.")
+      }
+    `
+  );
+}
+
+function printLeagueQrPoster() {
+  const qrUrl = `${API}/league/checkin-qr`;
+
+  const printWindow = window.open("", "_blank");
+
+  if (!printWindow) {
+    toast("The print window was blocked by the browser.", "error");
+    return;
+  }
+
+  printWindow.document.write(`
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+
+      <title>Robins Pokémon League Check-In</title>
+
+      <style>
+        * {
+          box-sizing: border-box;
         }
 
-        return `
-            <tr>
-                <td>
-                    <strong>
-                        ${esc(attendee.customer || attendee.discord_user_id || "Unknown")}
-                    </strong>
-                </td>
+        body {
+          margin: 0;
+          min-height: 100vh;
+          font-family: Arial, Helvetica, sans-serif;
+          background: white;
+          color: #111827;
+        }
 
-                <td>
-                    ${esc(formatDateTime(attendee.checked_in_at))}
-                </td>
+        .poster {
+          width: 210mm;
+          min-height: 297mm;
+          margin: 0 auto;
+          padding: 20mm;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          text-align: center;
+        }
 
-                <td>
-                    <span class="status-pill ${paymentClass}">
-                        ${paymentText}
-                    </span>
-                </td>
+        .eyebrow {
+          margin: 0 0 10px;
+          font-size: 18px;
+          font-weight: 700;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+          color: #b91c1c;
+        }
 
-                <td>
-                    ${actions}
-                </td>
-            </tr>
-        `;
-    }).join("");
+        h1 {
+          margin: 0;
+          font-size: 42px;
+          line-height: 1.05;
+        }
 
-    return (
-        header(
-            "Pokémon League",
-            "Current event, attendance and payments",
-            `
-                <button
-                    class="btn ${e ? "btn-danger" : "btn-success"}"
-                    data-action="${e ? "end-league" : "start-league"}"
-                >
-                    ${e ? "End Event" : "Start Event"}
-                </button>
-            `
-        )
-        + error()
-        + loading()
-        + `
-            <div class="league-status-card ${e ? "running" : "inactive"}">
-                <span>
-                    ${e ? "Running" : "Not Running"}
-                </span>
+        h2 {
+          margin: 12px 0 28px;
+          font-size: 24px;
+          font-weight: 500;
+        }
 
-                <strong>
-                    ${e ? esc(e["Store Code"] || "—") : "No active event"}
-                </strong>
+        .qr-shell {
+          padding: 18px;
+          background: white;
+          border: 3px solid #111827;
+          border-radius: 20px;
+        }
 
-                <small>
-                    ${
-                        e
-                            ? `${esc(attendees.length)} player(s) checked in`
-                            : "Start an event to generate a store code"
-                    }
-                </small>
-            </div>
-            
-            ${manualCheckin}
+        .qr-shell img {
+          display: block;
+          width: 105mm;
+          height: 105mm;
+        }
 
-            ${
-                e
-                    ? `
-                        <div class="stats-grid">
-                            <article class="stat-card">
-                                <span class="stat-label">Attendance</span>
-                                <div class="stat-value">
-                                    ${esc(attendees.length)}
-                                </div>
-                            </article>
+        .instructions {
+          max-width: 145mm;
+          margin-top: 30px;
+          font-size: 21px;
+          line-height: 1.5;
+        }
 
-                            <article class="stat-card">
-                                <span class="stat-label">Store Code</span>
-                                <div class="stat-value mono">
-                                    ${esc(e["Store Code"] || "—")}
-                                </div>
-                            </article>
+        .steps {
+          margin-top: 24px;
+          width: 100%;
+          max-width: 145mm;
+          text-align: left;
+          font-size: 19px;
+          line-height: 1.6;
+        }
 
-                            <article class="stat-card">
-                                <span class="stat-label">Entry Fee</span>
-                                <div class="stat-value">
-                                    ${dbSession ? money(dbSession.entry_fee) : "—"}
-                                </div>
-                            </article>
+        .steps strong {
+          display: inline-block;
+          width: 28px;
+        }
 
-                            <article class="stat-card">
-                                <span class="stat-label">Ends</span>
-                                <div class="stat-value small-value">
-                                    ${esc(formatDateTime(dbSession?.ends_at || e["End Time"]))}
-                                </div>
-                            </article>
-                        </div>
-                    `
-                    : ""
-            }
+        .footer {
+          margin-top: 36px;
+          font-size: 15px;
+          color: #6b7280;
+        }
 
-            ${
-                attendees.length
-                    ? `
-                        <div class="table-card league-payments-table">
-                            <table>
-                                <thead>
-                                    <tr>
-                                        <th>Player</th>
-                                        <th>Checked In</th>
-                                        <th>Payment</th>
-                                        <th>Actions</th>
-                                    </tr>
-                                </thead>
+        @page {
+          size: A4 portrait;
+          margin: 0;
+        }
 
-                                <tbody>
-                                    ${paymentRows}
-                                </tbody>
-                            </table>
-                        </div>
-                    `
-                    : empty("No attendance records.")
-            }
-        `
-    );
+        @media print {
+          body {
+            print-color-adjust: exact;
+            -webkit-print-color-adjust: exact;
+          }
+
+          .poster {
+            page-break-after: avoid;
+          }
+        }
+      </style>
+    </head>
+
+    <body>
+      <main class="poster">
+        <p class="eyebrow">Robins Hobby Cafe</p>
+
+        <h1>Pokémon League</h1>
+        <h2>Player Check-In</h2>
+
+        <div class="qr-shell">
+          <img
+            src="${qrUrl}"
+            alt="Robins Pokémon League Check-In QR"
+          >
+        </div>
+
+        <div class="instructions">
+          Scan the QR code to check in for today's Pokémon League.
+        </div>
+
+        <div class="steps">
+          <div><strong>1.</strong> Scan the QR code.</div>
+          <div><strong>2.</strong> Sign in with Discord.</div>
+          <div><strong>3.</strong> Enter the current Store Code displayed in the shop.</div>
+          <div><strong>4.</strong> Complete your League check-in.</div>
+        </div>
+
+        <div class="footer">
+          Your Discord account must have a linked Play! Pokémon Player ID.
+          <br>
+          Powered by RobinHub
+        </div>
+      </main>
+    </body>
+    </html>
+  `);
+
+  printWindow.document.close();
+
+  const qrImage = printWindow.document.querySelector("img");
+
+  qrImage.onload = () => {
+    printWindow.focus();
+    printWindow.print();
+  };
 }
+
 function capacityBlocks(cap) {
   return Object.entries(cap || {}).map(([day, events]) => `<section class="panel"><h2>${esc(day)}</h2>${events.map((e) => {
     const r = e.Registered || 0, c = e.Capacity || 0;
@@ -634,6 +883,8 @@ function bind() {
       state.lookup = null;
       clearTimeout(state.lookupTimer);
       render();
+    } else if (a === "print-league-qr") {
+      printLeagueQrPoster();  
     } else if (a === "approve") reservationAction(el.dataset.pin, "approve");
     else if (a === "decline") {
       const reason = prompt("Reason for declining this order:", "Staff declined reservation");
